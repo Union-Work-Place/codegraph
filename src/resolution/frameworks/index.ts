@@ -27,6 +27,7 @@ import { swiftObjcBridgeResolver } from './swift-objc';
 import { reactNativeBridgeResolver } from './react-native';
 import { expoModulesResolver } from './expo-modules';
 import { fabricViewResolver } from './fabric';
+import { qtResolver } from './qt';
 
 /**
  * All registered framework resolvers
@@ -70,6 +71,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   expoModulesResolver,
   // React Native Fabric / Codegen view components — TS spec → component nodes
   fabricViewResolver,
+  // Qt — C++ Q_PROPERTY/signals/slots extraction + QML↔C++ signal-slot bridging
+  qtResolver,
 ];
 
 /**
