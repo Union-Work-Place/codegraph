@@ -555,3 +555,416 @@ describe('blankQtMacros', () => {
     expect(result).toBe(src);
   });
 });
+
+// ---------------------------------------------------------------------------
+// QmlExtractor — enum declarations
+// ---------------------------------------------------------------------------
+
+describe('QmlExtractor — enum declarations', () => {
+  it('extracts an enum node', () => {
+    const src = `
+import QtQuick
+Item {
+    enum Status {
+        Active,
+        Inactive,
+        Pending
+    }
+}
+`.trim();
+    const result = new QmlExtractor('ui/Widget.qml', src).extract();
+    const enumNode = result.nodes.find((n) => n.kind === 'enum' && n.name === 'Status');
+    expect(enumNode).toBeDefined();
+    expect(enumNode!.language).toBe('qml');
+  });
+
+  it('extracts enum_member nodes', () => {
+    const src = `
+import QtQuick
+Item {
+    enum Priority {
+        Low,
+        Medium,
+        High
+    }
+}
+`.trim();
+    const result = new QmlExtractor('ui/Task.qml', src).extract();
+    const members = result.nodes.filter((n) => n.kind === 'enum_member');
+    expect(members.length).toBeGreaterThanOrEqual(3);
+    expect(members.some((m) => m.name === 'Low')).toBe(true);
+    expect(members.some((m) => m.name === 'Medium')).toBe(true);
+    expect(members.some((m) => m.name === 'High')).toBe(true);
+  });
+
+  it('emits a contains edge from parent component to enum node', () => {
+    const src = `
+import QtQuick
+Item {
+    enum Mode { Read, Write }
+}
+`.trim();
+    const result = new QmlExtractor('ui/Doc.qml', src).extract();
+    const enumNode = result.nodes.find((n) => n.kind === 'enum');
+    const rootComp = result.nodes.find((n) => n.kind === 'component');
+    expect(enumNode).toBeDefined();
+    const containsEdge = result.edges.find(
+      (e) => e.kind === 'contains' && e.source === rootComp!.id && e.target === enumNode!.id,
+    );
+    expect(containsEdge).toBeDefined();
+  });
+
+  it('does not confuse enum members with nested component types', () => {
+    const src = `
+import QtQuick
+Item {
+    enum Color { Red, Green, Blue }
+    Rectangle { color: "red" }
+}
+`.trim();
+    const result = new QmlExtractor('ui/Palette.qml', src).extract();
+    // Rectangle is a built-in — not an unresolved ref
+    const typeRef = result.unresolvedReferences.find((r) => r.referenceName === 'Red');
+    expect(typeRef).toBeUndefined();
+    const enumNode = result.nodes.find((n) => n.kind === 'enum');
+    expect(enumNode).toBeDefined();
+  });
+
+  it('extracts qualified enum member names', () => {
+    const src = `
+import QtQuick
+Item {
+    enum Direction { Up, Down, Left, Right }
+}
+`.trim();
+    const result = new QmlExtractor('ui/Arrow.qml', src).extract();
+    const member = result.nodes.find((n) => n.kind === 'enum_member' && n.name === 'Up');
+    expect(member).toBeDefined();
+    expect(member!.qualifiedName).toContain('Direction');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QmlExtractor — inline components (QML 6)
+// ---------------------------------------------------------------------------
+
+describe('QmlExtractor — inline components', () => {
+  it('extracts an inline component declaration', () => {
+    const src = `
+import QtQuick
+ApplicationWindow {
+    component MyButton: Rectangle {
+        property string label: ""
+        signal clicked()
+    }
+}
+`.trim();
+    const result = new QmlExtractor('ui/Main.qml', src).extract();
+    const inlineComp = result.nodes.find((n) => n.kind === 'component' && n.name === 'MyButton');
+    expect(inlineComp).toBeDefined();
+    expect(inlineComp!.language).toBe('qml');
+  });
+
+  it('marks inline component as exported', () => {
+    const src = `
+import QtQuick
+Item {
+    component Header: Rectangle {}
+}
+`.trim();
+    const result = new QmlExtractor('ui/Layout.qml', src).extract();
+    const header = result.nodes.find((n) => n.name === 'Header' && n.kind === 'component');
+    expect(header).toBeDefined();
+    expect(header!.isExported).toBe(true);
+  });
+
+  it('emits a references edge to the base type', () => {
+    const src = `
+import QtQuick
+Item {
+    component Badge: Rectangle {}
+}
+`.trim();
+    const result = new QmlExtractor('ui/Badge.qml', src).extract();
+    // Rectangle is a built-in — but we still emit the extends reference for traceability
+    const ref = result.unresolvedReferences.find(
+      (r) => r.referenceName === 'Rectangle',
+    );
+    expect(ref).toBeDefined();
+    expect(ref!.referenceKind).toBe('references');
+  });
+
+  it('captures properties inside inline component', () => {
+    const src = `
+import QtQuick
+Item {
+    component MyLabel: Text {
+        property color textColor: "black"
+        signal tapped()
+    }
+}
+`.trim();
+    const result = new QmlExtractor('ui/Labels.qml', src).extract();
+    const prop = result.nodes.find((n) => n.kind === 'property' && n.name === 'textColor');
+    const sig = result.nodes.find((n) => n.kind === 'method' && n.name === 'tapped');
+    expect(prop).toBeDefined();
+    expect(sig).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QmlExtractor — attached type handlers
+// ---------------------------------------------------------------------------
+
+describe('QmlExtractor — attached type handlers', () => {
+  it('extracts Component.onCompleted handler', () => {
+    const src = `
+import QtQuick
+Item {
+    Component.onCompleted: console.log("ready")
+}
+`.trim();
+    const result = new QmlExtractor('ui/Main.qml', src).extract();
+    const handler = result.nodes.find(
+      (n) => n.kind === 'method' && n.name === 'Component.onCompleted',
+    );
+    expect(handler).toBeDefined();
+    expect(handler!.signature).toContain('Component.onCompleted');
+  });
+
+  it('extracts Keys.onPressed handler', () => {
+    const src = `
+import QtQuick
+Item {
+    Keys.onPressed: (event) => { event.accepted = true }
+}
+`.trim();
+    const result = new QmlExtractor('ui/Input.qml', src).extract();
+    const handler = result.nodes.find(
+      (n) => n.kind === 'method' && n.name === 'Keys.onPressed',
+    );
+    expect(handler).toBeDefined();
+  });
+
+  it('emits a calls reference from attached handler to the signal name', () => {
+    const src = `
+import QtQuick
+Item {
+    Component.onCompleted: doInit()
+}
+`.trim();
+    const result = new QmlExtractor('ui/Main.qml', src).extract();
+    const ref = result.unresolvedReferences.find((r) => r.referenceName === 'completed');
+    expect(ref).toBeDefined();
+    expect(ref!.referenceKind).toBe('calls');
+  });
+
+  it('emits a references edge to the attached type', () => {
+    const src = `
+import QtQuick
+Item {
+    Keys.onReturnPressed: submit()
+}
+`.trim();
+    const result = new QmlExtractor('ui/Form.qml', src).extract();
+    const ref = result.unresolvedReferences.find(
+      (r) => r.referenceName === 'Keys' && r.referenceKind === 'references',
+    );
+    expect(ref).toBeDefined();
+  });
+
+  it('emits a contains edge from parent component to attached handler', () => {
+    const src = `
+import QtQuick
+Item {
+    Component.onDestruction: cleanup()
+}
+`.trim();
+    const result = new QmlExtractor('ui/Widget.qml', src).extract();
+    const handler = result.nodes.find((n) => n.name === 'Component.onDestruction');
+    const comp = result.nodes.find((n) => n.kind === 'component');
+    expect(handler).toBeDefined();
+    const edge = result.edges.find(
+      (e) => e.kind === 'contains' && e.source === comp!.id && e.target === handler!.id,
+    );
+    expect(edge).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// qtResolver — QML_NAMED_ELEMENT extraction
+// ---------------------------------------------------------------------------
+
+describe('qtResolver — QML_NAMED_ELEMENT extraction', () => {
+  const QT_CPP_NAMED = `
+#include <QObject>
+#include <QtQml>
+
+class PrivateCounter : public QObject {
+    Q_OBJECT
+    QML_NAMED_ELEMENT(Counter)
+public:
+    explicit PrivateCounter(QObject *parent = nullptr);
+signals:
+    void countChanged();
+};
+`.trim();
+
+  it('extracts a component alias node with the QML name', () => {
+    const { nodes } = qtResolver.extract!('src/counter.h', QT_CPP_NAMED);
+    const alias = nodes.find((n) => n.kind === 'component' && n.name === 'Counter');
+    expect(alias).toBeDefined();
+    expect(alias!.signature).toContain('QML_NAMED_ELEMENT(Counter)');
+  });
+
+  it('component alias node is in the same file as the C++ class', () => {
+    const { nodes } = qtResolver.extract!('src/counter.h', QT_CPP_NAMED);
+    const alias = nodes.find((n) => n.kind === 'component' && n.name === 'Counter');
+    expect(alias!.filePath).toBe('src/counter.h');
+  });
+
+  it('emits a references relation from the alias to the QML name', () => {
+    const { references } = qtResolver.extract!('src/counter.h', QT_CPP_NAMED);
+    const ref = references.find((r) => r.referenceName === 'Counter');
+    expect(ref).toBeDefined();
+  });
+
+  it('detects Qt project via QML_ELEMENT pattern', () => {
+    const ctx = {
+      getAllFiles: () => ['src/widget.h'],
+      readFile: (f: string) =>
+        f === 'src/widget.h'
+          ? 'class Foo {\n    QML_ELEMENT\n};\n'
+          : null,
+      getNodesByName: () => [],
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      getNodesByLowerName: () => [],
+      fileExists: () => false,
+      getProjectRoot: () => '/tmp',
+      getImportMappings: () => [],
+    };
+    // @ts-expect-error — minimal mock
+    expect(qtResolver.detect(ctx)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// qtResolver — qmlRegisterType extraction
+// ---------------------------------------------------------------------------
+
+describe('qtResolver — qmlRegisterType extraction', () => {
+  const SRC_SAME_NAME = `
+#include <QObject>
+#include <QtQml>
+class Counter : public QObject { Q_OBJECT };
+
+void registerTypes() {
+    qmlRegisterType<Counter>("com.example", 1, 0, "Counter");
+}
+`.trim();
+
+  const SRC_DIFF_NAME = `
+#include <QObject>
+#include <QtQml>
+class InternalCounter : public QObject { Q_OBJECT };
+
+void registerTypes() {
+    qmlRegisterType<InternalCounter>("com.example", 1, 0, "Counter");
+}
+`.trim();
+
+  it('does NOT create a duplicate alias when QML name equals C++ class name', () => {
+    const { nodes } = qtResolver.extract!('src/register.cpp', SRC_SAME_NAME);
+    const aliases = nodes.filter((n) => n.kind === 'component' && n.name === 'Counter');
+    expect(aliases).toHaveLength(0);
+  });
+
+  it('creates a component alias node when QML name differs from C++ class name', () => {
+    const { nodes } = qtResolver.extract!('src/register.cpp', SRC_DIFF_NAME);
+    const alias = nodes.find((n) => n.kind === 'component' && n.name === 'Counter');
+    expect(alias).toBeDefined();
+    expect(alias!.signature).toContain('InternalCounter');
+  });
+
+  it('emits a references edge to the C++ class being registered', () => {
+    const { references } = qtResolver.extract!('src/register.cpp', SRC_DIFF_NAME);
+    const ref = references.find((r) => r.referenceName === 'InternalCounter');
+    expect(ref).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// qtResolver — Q_INVOKABLE method extraction
+// ---------------------------------------------------------------------------
+
+describe('qtResolver — Q_INVOKABLE method extraction', () => {
+  const QT_CPP = `
+#include <QObject>
+class Calculator : public QObject {
+    Q_OBJECT
+public:
+    explicit Calculator(QObject *parent = nullptr);
+    Q_INVOKABLE double add(double a, double b);
+    Q_INVOKABLE QString formatResult(double value) const;
+    int notInvokable() const;
+signals:
+    void resultReady(double result);
+};
+`.trim();
+
+  it('extracts Q_INVOKABLE methods as method nodes tagged invokable', () => {
+    const { nodes } = qtResolver.extract!('src/calculator.h', QT_CPP);
+    const invokable = nodes.filter((n) => n.signature?.startsWith('invokable'));
+    expect(invokable.length).toBeGreaterThanOrEqual(2);
+    expect(invokable.some((n) => n.name === 'add')).toBe(true);
+    expect(invokable.some((n) => n.name === 'formatResult')).toBe(true);
+  });
+
+  it('does not tag non-Q_INVOKABLE methods as invokable', () => {
+    const { nodes } = qtResolver.extract!('src/calculator.h', QT_CPP);
+    const invokable = nodes.filter((n) => n.signature?.startsWith('invokable'));
+    expect(invokable.some((n) => n.name === 'notInvokable')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// blankQtMacros — Qt 6 QML macros
+// ---------------------------------------------------------------------------
+
+describe('blankQtMacros — Qt 6 QML macros', () => {
+  it('blanks QML_ELEMENT to same-length spaces', () => {
+    const src = 'class Foo : public QObject {\n    Q_OBJECT\n    QML_ELEMENT\n};\n';
+    const result = blankQtMacros(src);
+    expect(result).not.toContain('QML_ELEMENT');
+    expect(result.length).toBe(src.length);
+  });
+
+  it('blanks QML_NAMED_ELEMENT(Name) including parentheses', () => {
+    const src = 'class Counter : public QObject {\n    Q_OBJECT\n    QML_NAMED_ELEMENT(Counter)\n};\n';
+    const result = blankQtMacros(src);
+    expect(result).not.toContain('QML_NAMED_ELEMENT');
+    expect(result.length).toBe(src.length);
+  });
+
+  it('blanks QML_SINGLETON', () => {
+    const src = 'class App : public QObject {\n    Q_OBJECT\n    QML_SINGLETON\n};\n';
+    const result = blankQtMacros(src);
+    expect(result).not.toContain('QML_SINGLETON');
+    expect(result.length).toBe(src.length);
+  });
+
+  it('blanks QML_UNCREATABLE("reason") including parentheses', () => {
+    const src = '    QML_UNCREATABLE("Cannot create abstract type")\n';
+    const result = blankQtMacros(src);
+    expect(result).not.toContain('QML_UNCREATABLE');
+    expect(result.length).toBe(src.length);
+  });
+
+  it('blanks QML_VALUE_TYPE(name) including parentheses', () => {
+    const src = '    QML_VALUE_TYPE(point)\n';
+    const result = blankQtMacros(src);
+    expect(result).not.toContain('QML_VALUE_TYPE');
+    expect(result.length).toBe(src.length);
+  });
+});

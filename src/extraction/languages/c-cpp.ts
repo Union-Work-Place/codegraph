@@ -262,7 +262,11 @@ export function blankQtMacros(source: string): string {
   if (!source.includes('Q_OBJECT') && !source.includes('Q_GADGET') &&
       !source.includes('signals') && !source.includes('Q_SIGNALS') &&
       !source.includes('slots') && !source.includes('Q_SLOTS') &&
-      !source.includes('Q_INVOKABLE')) {
+      !source.includes('Q_INVOKABLE') &&
+      !source.includes('QML_ELEMENT') && !source.includes('QML_NAMED_ELEMENT') &&
+      !source.includes('QML_SINGLETON') && !source.includes('QML_UNCREATABLE') &&
+      !source.includes('QML_INTERFACE') && !source.includes('QML_VALUE_TYPE') &&
+      !source.includes('QML_ANONYMOUS')) {
     return source;
   }
 
@@ -278,7 +282,12 @@ export function blankQtMacros(source: string): string {
     // Blank signals:/Q_SIGNALS: keyword (keep the colon for brace-balance)
     .replace(/\b(Q_SIGNALS|signals)\s*(?=:)/g, (m) => ' '.repeat(m.length))
     // Blank slots:/Q_SLOTS: keyword (keep the colon)
-    .replace(/\b(Q_SLOTS|slots)\s*(?=:)/g, (m) => ' '.repeat(m.length));
+    .replace(/\b(Q_SLOTS|slots)\s*(?=:)/g, (m) => ' '.repeat(m.length))
+    // Qt 6 QML registration macros — blank with arguments (parenthesised forms)
+    // e.g. QML_NAMED_ELEMENT(Counter), QML_UNCREATABLE("reason"), QML_VALUE_TYPE(point)
+    .replace(/\bQML_(?:NAMED_ELEMENT|UNCREATABLE|VALUE_TYPE|ANONYMOUS)\s*\([^)]*\)/g, (m) => ' '.repeat(m.length))
+    // Blank zero-arg Qt 6 QML macros
+    .replace(/\bQML_(?:ELEMENT|SINGLETON|INTERFACE|FOREIGN\s*\([^)]*\))\b/g, (m) => ' '.repeat(m.length));
 }
 
 /**

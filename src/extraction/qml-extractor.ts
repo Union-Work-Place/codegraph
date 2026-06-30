@@ -74,6 +74,12 @@ const RE_FUNCTION = /^\s*function\s+(\w+)\s*\(([^)]*)\)/;
 /** Signal handler binding: onFoo: or onFoo { */
 const RE_HANDLER = /^\s*(on[A-Z][A-Za-z0-9.]*)\s*[:{]/;
 
+/** Attached type signal handler: TypeName.onFoo: or TypeName.onFoo { */
+const RE_ATTACHED_HANDLER = /^\s*([A-Z][A-Za-z0-9]*)\.(on[A-Z][A-Za-z0-9]*)\s*[:{]/;
+
+/** Inline component declaration (QML 6): component Name: BaseType { */
+const RE_INLINE_COMPONENT = /^\s*component\s+([A-Z][A-Za-z0-9]*)\s*:\s*([A-Z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*)\s*\{/;
+
 /** id: identifier */
 const RE_ID = /^\s*id\s*:\s*(\w+)/;
 
@@ -149,8 +155,10 @@ export class QmlExtractor {
     let jsFunctionNodeId: string | null = null;
     let jsFunctionParentId: string | null = null;
 
-    // Depth of the currently open multi-line enum (skip its body)
+    // Currently open enum block
     let enumDepth = 0;
+    let enumNodeId: string | null = null;
+    let enumName = '';
 
     // Track overall brace depth (lines with excess `{` can open a component)
     let braceBalance = 0;
@@ -203,6 +211,49 @@ export class QmlExtractor {
           this.handleImport(importMatch[1]!.trim(), importMatch[2], lineNum);
           continue;
         }
+      }
+
+      // ------------------------------------------------------------------
+      // Inline component declaration (QML 6): component Name: BaseType { ... }
+      // Must be checked before RE_COMPONENT since `component` starts lowercase.
+      // ------------------------------------------------------------------
+      const inlineCompMatch = line.match(RE_INLINE_COMPONENT);
+      if (inlineCompMatch) {
+        const [, inlineName, baseType] = inlineCompMatch;
+        const parentFrame = stack[stack.length - 1];
+        const nodeId = generateNodeId(this.filePath, 'component', inlineName!, lineNum);
+        const node: Node = {
+          id: nodeId,
+          kind: 'component',
+          name: inlineName!,
+          qualifiedName: `${this.filePath}::${inlineName}`,
+          filePath: this.filePath,
+          language: 'qml',
+          startLine: lineNum,
+          endLine: lineNum, // patched on close
+          startColumn: (line.match(/^\s*/)?.[0].length ?? 0),
+          endColumn: 0,
+          isExported: true,
+          updatedAt: Date.now(),
+        };
+        this.nodes.push(node);
+        if (parentFrame) {
+          this.edges.push({ source: parentFrame.nodeId, target: nodeId, kind: 'contains' });
+        }
+        // extends edge to the base type
+        this.unresolvedRefs.push({
+          fromNodeId: nodeId,
+          referenceName: baseType!,
+          referenceKind: 'references',
+          line: lineNum,
+          column: 0,
+          filePath: this.filePath,
+          language: 'qml',
+        });
+        stack.push({ nodeId, startLine: lineNum, typeName: inlineName! });
+        braceBalance++;
+        braceDepth.push(lineNum);
+        continue;
       }
 
       // ------------------------------------------------------------------
@@ -299,23 +350,75 @@ export class QmlExtractor {
       }
 
       // ------------------------------------------------------------------
-      // Enum declaration — skip its body (integers only, not components)
+      // Enum declaration — extract enum + enum_member nodes
       // ------------------------------------------------------------------
       if (enumDepth === 0) {
         const enumMatch = line.match(RE_ENUM);
         if (enumMatch) {
+          enumName = enumMatch[1]!;
+          const nodeId = generateNodeId(this.filePath, 'enum', enumName, lineNum);
+          enumNodeId = nodeId;
+          const currentFrame = stack[stack.length - 1];
+          const enumNode: Node = {
+            id: nodeId,
+            kind: 'enum',
+            name: enumName,
+            qualifiedName: `${this.filePath}::${enumName}`,
+            filePath: this.filePath,
+            language: 'qml',
+            startLine: lineNum,
+            endLine: lineNum,
+            startColumn: (line.match(/^\s*/)?.[0].length ?? 0),
+            endColumn: 0,
+            updatedAt: Date.now(),
+          };
+          this.nodes.push(enumNode);
+          if (currentFrame) {
+            this.edges.push({ source: currentFrame.nodeId, target: nodeId, kind: 'contains' });
+          }
           enumDepth = 1;
           braceBalance++;
+
+          // Process the rest of the opening line — may contain members and close
+          const afterBrace = line.slice(line.indexOf('{') + 1);
+          this.extractEnumLineMembers(afterBrace, enumName, nodeId, lineNum);
+          // Check if the enum closes on the same line
+          let depth = 1;
+          for (const ch of afterBrace) {
+            if (ch === '{') depth++;
+            else if (ch === '}') {
+              depth--;
+              if (depth === 0) {
+                enumNode.endLine = lineNum;
+                enumNodeId = null;
+                enumDepth = 0;
+                braceBalance--;
+                break;
+              }
+            }
+          }
           continue;
         }
       } else {
-        // track nested braces inside enum
+        // Track depth and extract enum members
+        let closed = false;
         for (const ch of line) {
           if (ch === '{') enumDepth++;
           else if (ch === '}') {
             enumDepth--;
-            if (enumDepth === 0) { braceBalance--; break; }
+            if (enumDepth === 0) {
+              const enumNode = this.nodes.find((n) => n.id === enumNodeId);
+              if (enumNode) enumNode.endLine = lineNum;
+              enumNodeId = null;
+              braceBalance--;
+              closed = true;
+              break;
+            }
           }
+        }
+        // Extract member identifier from lines inside the enum body
+        if (!closed && enumDepth > 0 && enumNodeId) {
+          this.extractEnumLineMembers(line, enumName, enumNodeId, lineNum);
         }
         continue;
       }
@@ -515,6 +618,54 @@ export class QmlExtractor {
         continue;
       }
 
+      // Attached type signal handler: TypeName.onFoo: or TypeName.onFoo {
+      // e.g. Component.onCompleted, Keys.onPressed, Layout.onChildrenChanged
+      const attachedMatch = line.match(RE_ATTACHED_HANDLER);
+      if (attachedMatch) {
+        const [, attachedType, handlerName] = attachedMatch;
+        const fullName = `${attachedType}.${handlerName}`;
+        const nodeId = generateNodeId(this.filePath, 'method', fullName, lineNum);
+        const node: Node = {
+          id: nodeId,
+          kind: 'method',
+          name: fullName,
+          qualifiedName: `${this.filePath}::${fullName}`,
+          filePath: this.filePath,
+          language: 'qml',
+          startLine: lineNum,
+          endLine: lineNum,
+          startColumn: (line.match(/^\s*/)?.[0].length ?? 0),
+          endColumn: line.length,
+          signature: `handler ${fullName}`,
+          updatedAt: Date.now(),
+        };
+        this.nodes.push(node);
+        this.edges.push({ source: currentFrame.nodeId, target: nodeId, kind: 'contains' });
+
+        // Emit reference to the underlying signal name (strip "on" prefix and lowercase)
+        const signalName = handlerName![2]!.toLowerCase() + handlerName!.slice(3);
+        this.unresolvedRefs.push({
+          fromNodeId: nodeId,
+          referenceName: signalName,
+          referenceKind: 'calls',
+          line: lineNum,
+          column: 0,
+          filePath: this.filePath,
+          language: 'qml',
+        });
+        // Also emit reference to the attached type (e.g. Component, Keys)
+        this.unresolvedRefs.push({
+          fromNodeId: nodeId,
+          referenceName: attachedType!,
+          referenceKind: 'references',
+          line: lineNum,
+          column: 0,
+          filePath: this.filePath,
+          language: 'qml',
+        });
+        continue;
+      }
+
       // ------------------------------------------------------------------
       // Any remaining lines with a { that we haven't matched as a component
       // still increment the brace balance so the stack stays correct.
@@ -547,6 +698,36 @@ export class QmlExtractor {
 
   // -------------------------------------------------------------------------
   // Import handling
+  // -------------------------------------------------------------------------
+  // Enum member helper — extract identifiers from a fragment of enum body text
+  // (handles both single-line `{ A, B, C }` and multi-line member lines).
+  // -------------------------------------------------------------------------
+
+  private extractEnumLineMembers(fragment: string, eName: string, eNodeId: string, lineNum: number): void {
+    // Split on commas and closing braces, take only word tokens
+    const tokens = fragment.replace(/\{/g, '').replace(/\}/g, '').split(',');
+    for (const tok of tokens) {
+      // May contain `= value` assignments — strip them
+      const memberName = tok.replace(/=.*$/, '').trim().split(/\s+/)[0];
+      if (!memberName || !/^\w+$/.test(memberName)) continue;
+      const memberId = generateNodeId(this.filePath, 'enum_member', `${eName}.${memberName}`, lineNum);
+      this.nodes.push({
+        id: memberId,
+        kind: 'enum_member',
+        name: memberName,
+        qualifiedName: `${this.filePath}::${eName}::${memberName}`,
+        filePath: this.filePath,
+        language: 'qml',
+        startLine: lineNum,
+        endLine: lineNum,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      });
+      this.edges.push({ source: eNodeId, target: memberId, kind: 'contains' });
+    }
+  }
+
   // -------------------------------------------------------------------------
 
   private handleImport(source: string, alias: string | undefined, lineNum: number): void {

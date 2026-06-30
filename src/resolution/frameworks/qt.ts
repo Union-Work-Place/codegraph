@@ -7,8 +7,11 @@
  *  - Extracts `Q_PROPERTY(...)` macro declarations as `property` nodes
  *  - Extracts `signals:` / `Q_SIGNALS:` section declarations as `method` nodes
  *  - Extracts `slots:` / `Q_SLOTS:` section declarations as `method` nodes
+ *  - Extracts `Q_INVOKABLE` methods as QML-callable method nodes
  *  - Emits edges for `QObject::connect()` SIGNAL/SLOT macro calls
  *  - Emits edges for modern `connect(&Src, &Src::sig, &Dst, &Dst::slot)` calls
+ *  - Extracts `QML_NAMED_ELEMENT(X)` as a `component` alias node
+ *  - Detects `qmlRegisterType<T>(uri, maj, min, "QmlName")` and creates alias nodes
  *
  * QML side:
  *  - Resolves QML signal handler names (`onFooChanged`) to C++ `fooChanged` signals
@@ -77,6 +80,30 @@ const RE_Q_PROPERTY = /Q_PROPERTY\s*\(\s*([^)]+)\)/g;
  */
 const RE_CONNECT_MACRO = /connect\s*\(\s*\w[^,]*,\s*SIGNAL\s*\(\s*(\w+)\s*\([^)]*\)\s*\)\s*,\s*\w[^,]*,\s*SLOT\s*\(\s*(\w+)\s*\([^)]*\)\s*\)/g;
 const RE_CONNECT_PTR = /connect\s*\(\s*\w[^,]*,\s*&\s*(\w+)\s*::\s*(\w+)\s*,\s*\w[^,]*,\s*&\s*(\w+)\s*::\s*(\w+)/g;
+
+/**
+ * QML_NAMED_ELEMENT(QmlTypeName) — registers the C++ class under a custom QML name.
+ * Only the first occurrence per class is used.
+ */
+const RE_QML_NAMED_ELEMENT = /\bQML_NAMED_ELEMENT\s*\(\s*(\w+)\s*\)/g;
+
+/**
+ * QML_ELEMENT — registers the C++ class as a QML element with the same name.
+ * Presence is checked during detection to confirm a file uses Qt 6 QML patterns.
+ */
+const QML_ELEMENT_PATTERN = /\bQML_ELEMENT\b/;
+
+/**
+ * qmlRegisterType<CppClass>("uri", major, minor, "QmlName")
+ * Captures the C++ type and the QML element name.
+ */
+const RE_QML_REGISTER_TYPE = /qmlRegisterType\s*<\s*(\w+)\s*>\s*\(\s*"[^"]*"\s*,\s*\d+\s*,\s*\d+\s*,\s*"(\w+)"\s*\)/g;
+
+/**
+ * Q_INVOKABLE method declaration outside of signals:/slots: sections.
+ * Captures the return type and method name for tagging as invokable.
+ */
+const RE_Q_INVOKABLE_DECL = /^\s*Q_INVOKABLE\s+(?:(?:virtual|inline|static|explicit|const)\s+)*(\S[\s\S]*?)\s+(\w+)\s*\(([^)]*)\)\s*(?:const\s*)?(?:override\s*)?(?:final\s*)?(?:noexcept\s*)?;/;
 
 /**
  * Matches a class or struct that contains Q_OBJECT/Q_GADGET.
@@ -209,6 +236,31 @@ function extractQtFromCpp(
         });
       }
     }
+
+    // Extract Q_INVOKABLE methods in the class body (outside signals/slots)
+    // These are callable from QML and should be tagged as invokable.
+    if (!currentSection && currentClass) {
+      const invokableMatch = line.match(RE_Q_INVOKABLE_DECL);
+      if (invokableMatch) {
+        const methodName = invokableMatch[2]!;
+        const params = invokableMatch[3] ?? '';
+        const nodeId = generateNodeId(filePath, 'method', `${currentClass}::${methodName}`, lineNum);
+        nodes.push({
+          id: nodeId,
+          kind: 'method',
+          name: methodName,
+          qualifiedName: `${filePath}::${currentClass}::${methodName}`,
+          filePath,
+          language: 'cpp' as Language,
+          startLine: lineNum,
+          endLine: lineNum,
+          startColumn: line.search(/\S/),
+          endColumn: line.trimEnd().length,
+          signature: `invokable ${methodName}(${params})`,
+          updatedAt: Date.now(),
+        });
+      }
+    }
   }
 
   // ---- pass 2: Q_PROPERTY extraction ----
@@ -319,6 +371,79 @@ function extractQtFromCpp(
     );
   }
 
+  // ---- pass 4: QML_NAMED_ELEMENT extraction ----
+  // Creates a `component` alias node so QML `TypeName { }` can resolve to the C++ class.
+  RE_QML_NAMED_ELEMENT.lastIndex = 0;
+  let qmlNamedMatch: RegExpExecArray | null;
+  while ((qmlNamedMatch = RE_QML_NAMED_ELEMENT.exec(content)) !== null) {
+    const qmlName = qmlNamedMatch[1]!;
+    const lineNum = content.slice(0, qmlNamedMatch.index).split('\n').length;
+    const nodeId = generateNodeId(filePath, 'component', qmlName, lineNum);
+    nodes.push({
+      id: nodeId,
+      kind: 'component',
+      name: qmlName,
+      qualifiedName: `${filePath}::${qmlName}`,
+      filePath,
+      language: 'cpp' as Language,
+      startLine: lineNum,
+      endLine: lineNum,
+      startColumn: 0,
+      endColumn: 0,
+      signature: `QML_NAMED_ELEMENT(${qmlName})`,
+      updatedAt: Date.now(),
+    });
+    // Emit a reference from this alias component to the C++ class (determined by
+    // the closest preceding class header in the file).
+    references.push({
+      fromNodeId: nodeId,
+      referenceName: qmlName,
+      referenceKind: 'references',
+      line: lineNum,
+      column: 0,
+      filePath,
+      language: 'cpp' as Language,
+    });
+  }
+
+  // ---- pass 5: qmlRegisterType<CppClass>(uri, major, minor, "QmlName") ----
+  RE_QML_REGISTER_TYPE.lastIndex = 0;
+  let qmlRegMatch: RegExpExecArray | null;
+  while ((qmlRegMatch = RE_QML_REGISTER_TYPE.exec(content)) !== null) {
+    const cppClass = qmlRegMatch[1]!;
+    const qmlName = qmlRegMatch[2]!;
+    const lineNum = content.slice(0, qmlRegMatch.index).split('\n').length;
+    // Only create an alias node when the QML name differs from the C++ class name,
+    // since same-name resolution already works via the class node.
+    if (qmlName !== cppClass) {
+      const nodeId = generateNodeId(filePath, 'component', qmlName, lineNum);
+      nodes.push({
+        id: nodeId,
+        kind: 'component',
+        name: qmlName,
+        qualifiedName: `${filePath}::${qmlName}`,
+        filePath,
+        language: 'cpp' as Language,
+        startLine: lineNum,
+        endLine: lineNum,
+        startColumn: 0,
+        endColumn: 0,
+        signature: `qmlRegisterType<${cppClass}>("${qmlName}")`,
+        updatedAt: Date.now(),
+      });
+    }
+    // Always emit a reference from the file to the C++ class being registered
+    references.push({
+      fromNodeId: generateNodeId(filePath, 'file', filePath, 1),
+      referenceName: cppClass,
+      referenceKind: 'references',
+      line: lineNum,
+      column: 0,
+      filePath,
+      language: 'cpp' as Language,
+    });
+  }
+
   return { nodes, references };
 }
 
@@ -361,7 +486,7 @@ export const qtResolver: FrameworkResolver = {
     for (const file of allFiles) {
       if (!file.endsWith('.cpp') && !file.endsWith('.h') && !file.endsWith('.hpp')) continue;
       const content = context.readFile(file);
-      if (content && (QT_INCLUDE_PATTERN.test(content) || Q_OBJECT_PATTERN.test(content))) {
+      if (content && (QT_INCLUDE_PATTERN.test(content) || Q_OBJECT_PATTERN.test(content) || QML_ELEMENT_PATTERN.test(content))) {
         return true;
       }
     }
