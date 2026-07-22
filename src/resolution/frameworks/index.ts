@@ -28,6 +28,8 @@ import { reactNativeBridgeResolver } from './react-native';
 import { expoModulesResolver } from './expo-modules';
 import { fabricViewResolver } from './fabric';
 import { qtResolver } from './qt';
+import { cicsResolver } from './cics';
+import { terraformResolver } from './terraform';
 
 /**
  * All registered framework resolvers
@@ -73,6 +75,10 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   fabricViewResolver,
   // Qt — C++ Q_PROPERTY/signals/slots extraction + QML↔C++ signal-slot bridging
   qtResolver,
+  // CICS pseudo-conversational TRANSID hops (COBOL)
+  cicsResolver,
+  // Terraform / OpenTofu — disambiguate var/local/module/resource refs to same-dir module
+  terraformResolver,
 ];
 
 /**
