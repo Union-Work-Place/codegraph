@@ -1586,23 +1586,23 @@ export function blankQtMacros(source: string): string {
 }
 
 /**
- * Combined preParse for C++: first blank Qt macros, then blank export macros.
+ * Combined preParse for C++: blank Qt macros first, then run the full
+ * macro-recovery pipeline (`preParseCppSource`) so both feature sets apply —
+ * Qt class macros (Q_OBJECT, Q_INVOKABLE, signals:/slots:) and the broader
+ * macro-annotated class/function recovery.
  */
-export function cppPreParse(source: string): string {
-  return blankCppExportMacros(blankQtMacros(source));
+export function cppPreParse(source: string, filePath?: string): string {
+  return preParseCppSource(blankQtMacros(source), filePath);
 }
 
 export const cppExtractor: LanguageExtractor = {
-  // Recover macro-annotated class/struct definitions (`class MYMODULE_API Foo : Base`)
-  // that tree-sitter otherwise misparses into a phantom function (#1061/#946).
+  // Recover macro-annotated class/struct definitions (`class MYMODULE_API Foo : Base`,
+  // #1061/#946) and macro-prefixed functions (`FORCEINLINE FString Foo()`, #1093
+  // follow-up) that tree-sitter otherwise misparses.
   // Also blanks Qt class macros (Q_OBJECT, Q_INVOKABLE, signals:, slots:) so the
   // surrounding C++ parses cleanly; Qt signal/slot method nodes are extracted by
   // the Qt framework resolver's extract() pass.
   preParse: cppPreParse,
-  // Recover macro-annotated class/struct definitions (`class MYMODULE_API Foo : Base`,
-  // #1061/#946) and macro-prefixed functions (`FORCEINLINE FString Foo()`, #1093
-  // follow-up) that tree-sitter otherwise misparses.
-  preParse: preParseCppSource,
   // Universal net for any macro the curated blank list misses.
   recoverMangledName: recoverMangledCppName,
   functionTypes: ['function_definition'],
