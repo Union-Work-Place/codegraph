@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Qt/QML graphs now connect signal handlers, calls through typed `id` and context-property objects, local enum values, component factories, and namespaced type registrations while leaving ambiguous owners unresolved instead of guessing.
 
 ## [1.6.0] - 2026-08-26
 

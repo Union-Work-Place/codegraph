@@ -26,7 +26,7 @@ import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
+import { detectLanguage, includeEmbeddedGrammarDependencies, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -1662,7 +1662,9 @@ export class ExtractionOrchestrator {
     await new Promise(resolve => setImmediate(resolve));
 
     // Detect needed languages and load grammars in the parse worker
-    const neededLanguages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides)))];
+      const neededLanguages = includeEmbeddedGrammarDependencies(
+          [...new Set(files.map((f) => detectLanguage(f, undefined, overrides)))],
+      );
     // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded when c is needed
     if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
       neededLanguages.push('cpp');
@@ -2874,7 +2876,9 @@ export class ExtractionOrchestrator {
     // Load only grammars needed for changed files
     if (filesToIndex.length > 0) {
       const overrides = loadExtensionOverrides(this.rootDir);
-      const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguage(f, undefined, overrides)))];
+        const neededLanguages = includeEmbeddedGrammarDependencies(
+            [...new Set(filesToIndex.map((f) => detectLanguage(f, undefined, overrides)))],
+        );
       // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded
       if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
         neededLanguages.push('cpp');

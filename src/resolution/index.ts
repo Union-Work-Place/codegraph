@@ -715,6 +715,7 @@ export class ReferenceResolver {
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
       rowId: ref.rowId,
+        candidates: ref.candidates,
     }));
 
     const total = refs.length;
@@ -972,6 +973,23 @@ export class ReferenceResolver {
     }
     if (this.profileStages) this.stageAdd('frameworks', ref, fwEarly !== null, tFw);
     if (fwEarly) return fwEarly;
+
+      // Owner-qualified QML refs are terminal: if Qt cannot prove the owner,
+      // generic name matching must not guess among same-named members.
+      if (
+          ref.language === 'qml' &&
+          ref.candidates?.some(
+              (candidate) =>
+                  candidate.startsWith('qt.qml-id|') ||
+                  candidate.startsWith('qt.context-property|') ||
+                  candidate.startsWith('qt.enum-member|') ||
+                  (ref.referenceKind === 'calls' && candidate.endsWith(`::${ref.referenceName}`)),
+          )
+      ) {
+          return candidates.length > 0
+              ? candidates.reduce((best, curr) => curr.confidence > best.confidence ? curr : best)
+              : null;
+      }
 
     // Strategy 2: Try import-based resolution
     const tImp = this.profileStages ? process.hrtime.bigint() : 0n;
@@ -1347,6 +1365,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+          candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
@@ -1467,6 +1486,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+          candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {

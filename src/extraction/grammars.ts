@@ -442,6 +442,12 @@ export async function loadAllGrammars(): Promise<void> {
   await loadGrammarsForLanguages(allLanguages);
 }
 
+export function includeEmbeddedGrammarDependencies(languages: Language[]): Language[] {
+  const required = new Set(languages);
+  if (required.has('qml')) required.add('javascript');
+  return [...required];
+}
+
 /**
  * Check if grammars have been initialized
  */

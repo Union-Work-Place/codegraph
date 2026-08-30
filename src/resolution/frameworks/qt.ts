@@ -94,10 +94,13 @@ const RE_QML_NAMED_ELEMENT = /\bQML_NAMED_ELEMENT\s*\(\s*(\w+)\s*\)/g;
 const QML_ELEMENT_PATTERN = /\bQML_ELEMENT\b/;
 
 /**
- * qmlRegisterType<CppClass>("uri", major, minor, "QmlName")
- * Captures the C++ type and the QML element name.
+ * qmlRegister{,Singleton,Uncreatable}Type<CppClass>("uri", major, minor, "QmlName")
+ * Captures the registration API, namespaced C++ type, and QML element name.
  */
-const RE_QML_REGISTER_TYPE = /qmlRegisterType\s*<\s*(\w+)\s*>\s*\(\s*"[^"]*"\s*,\s*\d+\s*,\s*\d+\s*,\s*"(\w+)"\s*\)/g;
+const RE_QML_REGISTER_TYPE = /\b(qmlRegister(?:Singleton|Uncreatable)?Type)\s*<\s*((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)\s*>\s*\(\s*"[^"]*"\s*,\s*\d+\s*,\s*\d+\s*,\s*"([A-Za-z_]\w*)"/g;
+
+/** A literal context name and bare pointer variable passed to setContextProperty. */
+const RE_SET_CONTEXT_PROPERTY = /\b((?:(?:[A-Za-z_]\w*)\s*(?:\.|->)\s*)?rootContext\s*\(\s*\)|([A-Za-z_]\w*))\s*->\s*setContextProperty\s*\(\s*"([A-Za-z_$][\w$]*)"\s*,\s*([A-Za-z_]\w*)\s*\)/g;
 
 /**
  * Q_INVOKABLE method declaration outside of signals:/slots: sections.
@@ -154,6 +157,42 @@ function parseQProperty(macroBody: string): QProp | null {
   return result;
 }
 
+function getUniquePointerType(content: string, variableName: string): string | null {
+    const escapedName = variableName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const declaration = new RegExp(
+        `\\b((?:[A-Za-z_]\\w*\\s*::\\s*)*[A-Za-z_]\\w*)\\s*\\*+\\s*${escapedName}\\b`,
+        'g',
+    );
+    const types = new Set<string>();
+    let match: RegExpExecArray | null;
+    while ((match = declaration.exec(content)) !== null) {
+        types.add(match[1]!.replace(/\s*::\s*/g, '::'));
+    }
+    return types.size === 1 ? [...types][0]! : null;
+}
+
+function getEnclosingFunctionPrefix(content: string, offset: number): string | null {
+    const openings: number[] = [];
+    for (let index = 0; index < offset; index++) {
+        if (content[index] === '{') openings.push(index);
+        else if (content[index] === '}') openings.pop();
+    }
+    for (let index = openings.length - 1; index >= 0; index--) {
+        const opening = openings[index]!;
+        const previousDelimiter = Math.max(
+            content.lastIndexOf(';', opening - 1),
+            content.lastIndexOf('}', opening - 1),
+            content.lastIndexOf('{', opening - 1),
+        );
+        const headerStart = previousDelimiter + 1;
+        const header = content.slice(headerStart, opening).trim();
+        if (!/\([^;{}]*\)\s*(?:const\s*)?$/.test(header)) continue;
+        if (/^(?:if|for|while|switch|catch)\b/.test(header)) continue;
+        return content.slice(headerStart, offset);
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // Main extractor function
 // ---------------------------------------------------------------------------
@@ -172,6 +211,7 @@ function extractQtFromCpp(
 
   const lines = content.split('\n');
   let currentClass: string | null = null;
+    const classAtLine = new Map<number, string>();
   let currentSection: 'signals' | 'slots' | null = null;
   let braceDepth = 0;
   let classBraceDepth = -1;
@@ -200,6 +240,7 @@ function extractQtFromCpp(
       currentClass = classMatch[1]!;
       classBraceDepth = braceDepth - 1; // depth at open brace
     }
+      if (currentClass) classAtLine.set(lineNum, currentClass);
 
     // Detect section change
     if (RE_SECTION.test(line)) {
@@ -240,10 +281,18 @@ function extractQtFromCpp(
     // Extract Q_INVOKABLE methods in the class body (outside signals/slots)
     // These are callable from QML and should be tagged as invokable.
     if (!currentSection && currentClass) {
-      const invokableMatch = line.match(RE_Q_INVOKABLE_DECL);
+        const declarationLines = [line];
+        if (line.includes('Q_INVOKABLE') && !line.includes(';')) {
+            for (let next = i + 1; next < lines.length; next++) {
+                declarationLines.push(lines[next]!);
+                if (lines[next]!.includes(';')) break;
+            }
+        }
+        const declaration = declarationLines.join('\n');
+        const invokableMatch = declaration.match(RE_Q_INVOKABLE_DECL);
       if (invokableMatch) {
         const methodName = invokableMatch[2]!;
-        const params = invokableMatch[3] ?? '';
+          const params = (invokableMatch[3] ?? '').replace(/\s+/g, ' ').trim();
         const nodeId = generateNodeId(filePath, 'method', `${currentClass}::${methodName}`, lineNum);
         nodes.push({
           id: nodeId,
@@ -253,9 +302,9 @@ function extractQtFromCpp(
           filePath,
           language: 'cpp' as Language,
           startLine: lineNum,
-          endLine: lineNum,
+            endLine: lineNum + declarationLines.length - 1,
           startColumn: line.search(/\S/),
-          endColumn: line.trimEnd().length,
+            endColumn: declarationLines.at(-1)!.trimEnd().length,
           signature: `invokable ${methodName}(${params})`,
           updatedAt: Date.now(),
         });
@@ -378,6 +427,8 @@ function extractQtFromCpp(
   while ((qmlNamedMatch = RE_QML_NAMED_ELEMENT.exec(content)) !== null) {
     const qmlName = qmlNamedMatch[1]!;
     const lineNum = content.slice(0, qmlNamedMatch.index).split('\n').length;
+      const cppClass = classAtLine.get(lineNum);
+      if (!cppClass) continue;
     const nodeId = generateNodeId(filePath, 'component', qmlName, lineNum);
     nodes.push({
       id: nodeId,
@@ -390,14 +441,14 @@ function extractQtFromCpp(
       endLine: lineNum,
       startColumn: 0,
       endColumn: 0,
-      signature: `QML_NAMED_ELEMENT(${qmlName})`,
+        signature: `QML_NAMED_ELEMENT(${qmlName}) owner ${cppClass}`,
       updatedAt: Date.now(),
     });
     // Emit a reference from this alias component to the C++ class (determined by
     // the closest preceding class header in the file).
     references.push({
       fromNodeId: nodeId,
-      referenceName: qmlName,
+        referenceName: cppClass,
       referenceKind: 'references',
       line: lineNum,
       column: 0,
@@ -406,16 +457,18 @@ function extractQtFromCpp(
     });
   }
 
-  // ---- pass 5: qmlRegisterType<CppClass>(uri, major, minor, "QmlName") ----
+    // ---- pass 5: qmlRegister*Type<CppClass>(uri, major, minor, "QmlName") ----
   RE_QML_REGISTER_TYPE.lastIndex = 0;
   let qmlRegMatch: RegExpExecArray | null;
   while ((qmlRegMatch = RE_QML_REGISTER_TYPE.exec(content)) !== null) {
-    const cppClass = qmlRegMatch[1]!;
-    const qmlName = qmlRegMatch[2]!;
+      const registration = qmlRegMatch[1]!;
+      const cppClass = qmlRegMatch[2]!.replace(/\s*::\s*/g, '::');
+      const qmlName = qmlRegMatch[3]!;
+      const cppClassName = cppClass.split('::').pop()!;
     const lineNum = content.slice(0, qmlRegMatch.index).split('\n').length;
     // Only create an alias node when the QML name differs from the C++ class name,
     // since same-name resolution already works via the class node.
-    if (qmlName !== cppClass) {
+      if (qmlName !== cppClassName) {
       const nodeId = generateNodeId(filePath, 'component', qmlName, lineNum);
       nodes.push({
         id: nodeId,
@@ -428,7 +481,7 @@ function extractQtFromCpp(
         endLine: lineNum,
         startColumn: 0,
         endColumn: 0,
-        signature: `qmlRegisterType<${cppClass}>("${qmlName}")`,
+          signature: `${registration}<${cppClass}>("${qmlName}")`,
         updatedAt: Date.now(),
       });
     }
@@ -443,6 +496,37 @@ function extractQtFromCpp(
       language: 'cpp' as Language,
     });
   }
+
+    // ---- pass 6: QQmlContext::setContextProperty extraction ----
+    RE_SET_CONTEXT_PROPERTY.lastIndex = 0;
+    let contextPropertyMatch: RegExpExecArray | null;
+    while ((contextPropertyMatch = RE_SET_CONTEXT_PROPERTY.exec(content)) !== null) {
+        const receiverExpression = contextPropertyMatch[1]!;
+        const receiverName = contextPropertyMatch[2];
+        const contextName = contextPropertyMatch[3]!;
+        const valueName = contextPropertyMatch[4]!;
+        const functionPrefix = getEnclosingFunctionPrefix(content, contextPropertyMatch.index);
+        if (!functionPrefix) continue;
+        if (receiverName && getUniquePointerType(functionPrefix, receiverName) !== 'QQmlContext') continue;
+        if (!receiverName && !/rootContext\s*\(/.test(receiverExpression)) continue;
+        const valueType = getUniquePointerType(functionPrefix, valueName);
+        if (!valueType) continue;
+        const lineNum = content.slice(0, contextPropertyMatch.index).split('\n').length;
+        nodes.push({
+            id: generateNodeId(filePath, 'variable', `qt-context-property:${contextName}`, lineNum),
+            kind: 'variable',
+            name: contextName,
+            qualifiedName: `${filePath}::qt-context-property::${contextName}`,
+            filePath,
+            language: 'cpp' as Language,
+            startLine: lineNum,
+            endLine: lineNum,
+            startColumn: 0,
+            endColumn: 0,
+            signature: `qt.context-property|${contextName}|${valueType}`,
+            updatedAt: Date.now(),
+        });
+    }
 
   return { nodes, references };
 }
@@ -466,6 +550,62 @@ function handlerToSignalName(handlerName: string): string {
  */
 function isQmlSignalHandler(name: string): boolean {
   return /^on[A-Z]/.test(name);
+}
+
+function getOwnedQmlSignal(ref: UnresolvedRef): { ownerName: string; signalName: string } | null {
+    if (ref.language !== 'qml' || ref.referenceKind !== 'calls') return null;
+    for (const candidate of ref.candidates ?? []) {
+        const separator = candidate.lastIndexOf('::');
+        if (separator <= 0) continue;
+        const ownerName = candidate.slice(0, separator);
+        const signalName = candidate.slice(separator + 2);
+        if (signalName === ref.referenceName) return { ownerName, signalName };
+    }
+    return null;
+}
+
+function getQmlIdCall(ref: UnresolvedRef): { ownerName: string; methodName: string } | null {
+    if (ref.language !== 'qml' || ref.referenceKind !== 'calls') return null;
+    for (const candidate of ref.candidates ?? []) {
+        const match = candidate.match(/^qt\.qml-id\|[^|]+\|([^|]+)\|([^|]+)$/);
+        if (match) return { ownerName: match[1]!, methodName: match[2]! };
+    }
+    return null;
+}
+
+function getQmlContextPropertyCall(ref: UnresolvedRef): { contextName: string; methodName: string } | null {
+    if (ref.language !== 'qml' || ref.referenceKind !== 'calls') return null;
+    for (const candidate of ref.candidates ?? []) {
+        const match = candidate.match(/^qt\.context-property\|([^|]+)\|([^|]+)$/);
+        if (match) return { contextName: match[1]!, methodName: match[2]! };
+    }
+    return null;
+}
+
+function getRegisteredOwnerNames(
+    context: ResolutionContext,
+    qmlName: string,
+    singletonOnly = false,
+): Set<string> {
+    const owners = new Set<string>();
+    const registrationPattern = singletonOnly
+        ? /^qmlRegisterSingletonType<([^>]+)>\("[^"]+"\)$/
+        : /^qmlRegister(?:Singleton|Uncreatable)?Type<([^>]+)>\("[^"]+"\)$/;
+    const namedElementPattern = /^QML_NAMED_ELEMENT\([^)]+\) owner (.+)$/;
+    for (const node of context.getNodesByName(qmlName)) {
+        const owner = node.signature?.match(registrationPattern)?.[1]
+            ?? (!singletonOnly ? node.signature?.match(namedElementPattern)?.[1] : undefined);
+        if (owner) owners.add(owner.split('::').pop()!);
+    }
+    return owners;
+}
+
+function getQmlEnumMember(ref: UnresolvedRef): { ownerName: string; memberName: string } | null {
+    for (const candidate of ref.candidates ?? []) {
+        const match = candidate.match(/^qt\.enum-member\|([^|]+)\|([^|]+)$/);
+        if (match) return { ownerName: match[1]!, memberName: match[2]! };
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +656,125 @@ export const qtResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+      const qmlEnumMember = getQmlEnumMember(ref);
+      if (qmlEnumMember) {
+          const ownerParts = qmlEnumMember.ownerName.split('::');
+          const candidates = context.getNodesByName(qmlEnumMember.memberName).filter(
+              (node: Node) => {
+                  if (node.kind !== 'enum_member') return false;
+                  const qualifiedParts = node.qualifiedName.split('::');
+                  if (qualifiedParts.at(-1) !== qmlEnumMember.memberName) return false;
+                  const ownerPath = qualifiedParts.slice(0, -1);
+                  return ownerPath.some((_, index) =>
+                      ownerParts.every((part, ownerIndex) => ownerPath[index + ownerIndex] === part),
+                  );
+              },
+          );
+          if (candidates.length === 1) {
+              return {
+                  original: ref,
+                  targetNodeId: candidates[0]!.id,
+                  confidence: 0.97,
+                  resolvedBy: 'framework',
+              };
+          }
+          return null;
+      }
+
+      const contextPropertyCall = getQmlContextPropertyCall(ref);
+      if (contextPropertyCall) {
+          const registrationPrefix = `qt.context-property|${contextPropertyCall.contextName}|`;
+          const ownerTypes = new Set(
+              context.getNodesByName(contextPropertyCall.contextName)
+                  .map((node: Node) => node.signature)
+                  .filter((signature): signature is string => signature?.startsWith(registrationPrefix) ?? false)
+                  .map((signature) => signature.slice(registrationPrefix.length)),
+          );
+          if (ownerTypes.size === 0) {
+              for (const owner of getRegisteredOwnerNames(context, contextPropertyCall.contextName, true)) {
+                  ownerTypes.add(owner);
+              }
+          }
+          if (ownerTypes.size !== 1) return null;
+          const ownerName = [...ownerTypes][0]!.split('::').pop()!;
+          const qualifiedSuffix = `::${ownerName}::${contextPropertyCall.methodName}`;
+          const candidates = context.getNodesByName(contextPropertyCall.methodName).filter(
+              (node: Node) =>
+                  node.kind === 'method' &&
+                  (node.language === 'cpp' || node.language === 'c') &&
+                  node.qualifiedName.endsWith(qualifiedSuffix) &&
+                  /^(?:invokable|slot) /.test(node.signature ?? ''),
+          );
+          if (candidates.length === 1) {
+              return {
+                  original: ref,
+                  targetNodeId: candidates[0]!.id,
+                  confidence: 0.97,
+                  resolvedBy: 'framework',
+              };
+          }
+          return null;
+      }
+
+      const qmlIdCall = getQmlIdCall(ref);
+      if (qmlIdCall) {
+          const ownerNames = new Set([qmlIdCall.ownerName]);
+          const registeredTypes = getRegisteredOwnerNames(context, qmlIdCall.ownerName);
+          if (registeredTypes.size > 1) return null;
+          if (registeredTypes.size === 1) {
+              ownerNames.add([...registeredTypes][0]!.split('::').pop()!);
+          }
+          const candidates = context.getNodesByName(qmlIdCall.methodName).filter((node: Node) => {
+              if (node.language === 'qml') {
+                  return (
+                      (node.kind === 'function' || node.kind === 'method') &&
+                      path.basename(node.filePath, path.extname(node.filePath)) === qmlIdCall.ownerName
+                  );
+              }
+              if (node.kind !== 'method' || (node.language !== 'cpp' && node.language !== 'c')) return false;
+              if (!/^(?:invokable|slot|signal) /.test(node.signature ?? '')) return false;
+              return [...ownerNames].some(
+                  (ownerName) => node.qualifiedName.endsWith(`::${ownerName}::${qmlIdCall.methodName}`),
+              );
+          });
+          if (candidates.length === 1) {
+              return {
+                  original: ref,
+                  targetNodeId: candidates[0]!.id,
+                  confidence: 0.97,
+                  resolvedBy: 'framework',
+              };
+          }
+          return null;
+      }
+
+      const ownedSignal = getOwnedQmlSignal(ref);
+      if (ownedSignal) {
+          const ownerNames = getRegisteredOwnerNames(context, ownedSignal.ownerName);
+          ownerNames.add(ownedSignal.ownerName);
+          const candidates = context.getNodesByName(ownedSignal.signalName).filter((node: Node) => {
+              if (node.kind !== 'method' || !node.signature?.startsWith('signal ')) return false;
+              if (node.language === 'qml') {
+                  return path.basename(node.filePath, path.extname(node.filePath)) === ownedSignal.ownerName;
+              }
+              if (node.language === 'cpp' || node.language === 'c') {
+                  return [...ownerNames].some(
+                      (ownerName) => node.qualifiedName.includes(`::${ownerName}::${ownedSignal.signalName}`),
+                  );
+              }
+              return false;
+          });
+          if (candidates.length === 1) {
+              return {
+                  original: ref,
+                  targetNodeId: candidates[0]!.id,
+                  confidence: 0.95,
+                  resolvedBy: 'framework',
+              };
+          }
+          return null;
+      }
+
     // QML → C++ signal handler resolution
     // A QML `onFooChanged:` binding references the `fooChanged` signal,
     // which may be declared in a C++ QObject class.
@@ -535,14 +794,16 @@ export const qtResolver: FrameworkResolver = {
       // Multiple candidates — pick the one in the same directory as the QML file
       if (candidates.length > 1) {
         const qmlDir = path.dirname(ref.filePath);
-        const sameDir = candidates.find((n: Node) => path.dirname(n.filePath) === qmlDir);
-        const target = sameDir ?? candidates[0]!;
-        return {
-          original: ref,
-          targetNodeId: target.id,
-          confidence: 0.65,
-          resolvedBy: 'framework',
-        };
+          const sameDir = candidates.filter((n: Node) => path.dirname(n.filePath) === qmlDir);
+          if (sameDir.length === 1) {
+              return {
+                  original: ref,
+              targetNodeId: sameDir[0]!.id,
+              confidence: 0.65,
+              resolvedBy: 'framework',
+          };
+          }
+          return null;
       }
     }
 
@@ -581,7 +842,8 @@ export const qtResolver: FrameworkResolver = {
   },
 
   claimsReference(name: string): boolean {
-    // Claim QML signal handler references even if no node is named that yet
-    return isQmlSignalHandler(name);
+      // Claim QML signal handlers and member calls even if no node has the
+      // composite call-site name (e.g. `service.refresh`) in the index.
+      return isQmlSignalHandler(name) || /^[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*$/.test(name);
   },
 };

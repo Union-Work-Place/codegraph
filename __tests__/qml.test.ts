@@ -5,11 +5,22 @@
  * the Qt framework resolver (C++ signal/slot extraction).
  */
 
-import { describe, it, expect } from 'vitest';
+import { beforeAll, describe, it, expect } from 'vitest';
 import { QmlExtractor } from '../src/extraction/qml-extractor';
 import { qtResolver } from '../src/resolution/frameworks/qt';
-import { detectLanguage, isSourceFile } from '../src/extraction/grammars';
+import {
+    detectLanguage,
+    includeEmbeddedGrammarDependencies,
+    initGrammars,
+    isSourceFile,
+    loadAllGrammars,
+} from '../src/extraction/grammars';
 import { blankQtMacros } from '../src/extraction/languages/c-cpp';
+
+beforeAll(async () => {
+    await initGrammars();
+    await loadAllGrammars();
+});
 
 // ---------------------------------------------------------------------------
 // Language detection
@@ -24,6 +35,10 @@ describe('QML language detection', () => {
   it('treats .qml as a source file', () => {
     expect(isSourceFile('ui/Main.qml')).toBe(true);
   });
+
+    it('loads JavaScript grammar for embedded QML bodies', () => {
+        expect(includeEmbeddedGrammarDependencies(['qml'])).toEqual(['qml', 'javascript']);
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -222,6 +237,21 @@ Item {
     const ref = result.unresolvedReferences.find((r) => r.referenceName === 'fooChanged');
     expect(ref).toBeDefined();
     expect(ref!.referenceKind).toBe('calls');
+      expect(ref!.candidates).toEqual(['Main::fooChanged']);
+  });
+
+    it('records the nested component type as the signal owner', () => {
+        const src = `
+import QtQuick
+Item {
+    CustomPanel {
+        onSaved: publishValue()
+    }
+}
+`.trim();
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const ref = result.unresolvedReferences.find((r) => r.referenceName === 'saved');
+        expect(ref?.candidates).toEqual(['CustomPanel::saved']);
   });
 });
 
@@ -284,6 +314,27 @@ Item {
     );
     expect(typeRef).toBeDefined();
   });
+
+    it('qualifies calls through an unambiguous QML id with its component type', () => {
+        const src = `
+import Demo.Ui
+Item {
+    NativePanel {
+        id: backend
+    }
+    function refreshPanel() {
+        backend.refresh()
+    }
+}
+`.trim();
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const ref = result.unresolvedReferences.find(
+            (candidate) => candidate.referenceName === 'backend.refresh',
+        );
+
+        expect(ref?.referenceKind).toBe('calls');
+        expect(ref?.candidates).toContain('qt.qml-id|backend|NativePanel|refresh');
+    });
 });
 
 describe('QmlExtractor — error resilience', () => {
@@ -437,15 +488,60 @@ void setup(Counter *c, Display *d) {
   });
 });
 
+describe('qtResolver — setContextProperty extraction', () => {
+    it('records a literal context property backed by a typed pointer', () => {
+        const src = `
+#include <QQmlContext>
+void expose(QQmlContext *context, Demo::ReportBridge *service) {
+    context->setContextProperty("reportService", service);
+}
+`.trim();
+        const { nodes } = qtResolver.extract!('src/bootstrap.cpp', src);
+        expect(nodes).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                kind: 'variable',
+                name: 'reportService',
+                signature: 'qt.context-property|reportService|Demo::ReportBridge',
+            }),
+        ]));
+    });
+
+    it('ignores dynamic values and untyped receivers', () => {
+        const src = `
+#include <QQmlContext>
+void expose(OtherContext *context, Demo::ReportBridge *service) {
+    context->setContextProperty("wrongReceiver", service);
+    engine.rootContext()->setContextProperty("dynamicValue", makeService());
+}
+`.trim();
+        const { nodes } = qtResolver.extract!('src/bootstrap.cpp', src);
+        expect(nodes.filter((node) => node.signature?.startsWith('qt.context-property|'))).toEqual([]);
+    });
+
+    it('does not borrow receiver and value types from another function scope', () => {
+        const src = `
+#include <QQmlContext>
+void typedElsewhere(QQmlContext *context, Demo::ReportBridge *service) {}
+void expose() {
+    auto context = makeOtherContext();
+    auto service = makeOtherService();
+    context->setContextProperty("reportService", service);
+}
+`.trim();
+        const { nodes } = qtResolver.extract!('src/bootstrap.cpp', src);
+        expect(nodes.filter((node) => node.signature?.startsWith('qt.context-property|'))).toEqual([]);
+    });
+});
+
 describe('qtResolver — QML signal handler resolution', () => {
-  it('resolves onFooChanged to fooChanged signal in C++', () => {
+    it('resolves a handler signal only within its declared owner', () => {
     const signalNode = {
       id: 'sig-1',
       kind: 'method' as const,
       name: 'fooChanged',
-      qualifiedName: 'src/widget.h::Widget::fooChanged',
-      filePath: 'src/widget.h',
-      language: 'cpp' as const,
+        qualifiedName: 'ui/Widget.qml::fooChanged',
+        filePath: 'ui/Widget.qml',
+        language: 'qml' as const,
       startLine: 10,
       endLine: 10,
       startColumn: 0,
@@ -457,6 +553,7 @@ describe('qtResolver — QML signal handler resolution', () => {
     const ctx = {
       getAllFiles: () => ['ui/Main.qml', 'src/widget.h'],
       readFile: () => null,
+        getNodesInFile: () => [],
       getNodesByName: (name: string) => (name === 'fooChanged' ? [signalNode] : []),
       getNodesByQualifiedName: () => [],
       getNodesByKind: () => [],
@@ -468,12 +565,13 @@ describe('qtResolver — QML signal handler resolution', () => {
 
     const ref = {
       fromNodeId: 'handler-1',
-      referenceName: 'onFooChanged',
+        referenceName: 'fooChanged',
       referenceKind: 'calls' as const,
       line: 5,
       column: 4,
       filePath: 'ui/Main.qml',
       language: 'qml' as const,
+        candidates: ['Widget::fooChanged'],
     };
 
     // @ts-expect-error — minimal mock
@@ -482,6 +580,48 @@ describe('qtResolver — QML signal handler resolution', () => {
     expect(resolved!.targetNodeId).toBe('sig-1');
     expect(resolved!.resolvedBy).toBe('framework');
   });
+
+    it('does not resolve a same-named signal from another QML owner', () => {
+        const otherSignal = {
+            id: 'sig-other',
+            kind: 'method' as const,
+            name: 'clicked',
+            qualifiedName: 'ui/OtherButton.qml::clicked',
+            filePath: 'ui/OtherButton.qml',
+            language: 'qml' as const,
+            startLine: 3,
+            endLine: 3,
+            startColumn: 0,
+            endColumn: 20,
+            updatedAt: Date.now(),
+            signature: 'signal clicked()',
+        };
+        const ctx = {
+            getAllFiles: () => ['ui/Main.qml', 'ui/OtherButton.qml'],
+            readFile: () => null,
+            getNodesInFile: () => [],
+            getNodesByName: (name: string) => (name === 'clicked' ? [otherSignal] : []),
+            getNodesByQualifiedName: () => [],
+            getNodesByKind: () => [],
+            getNodesByLowerName: () => [],
+            fileExists: () => false,
+            getProjectRoot: () => '/tmp',
+            getImportMappings: () => [],
+        };
+        const ref = {
+            fromNodeId: 'handler-1',
+            referenceName: 'clicked',
+            referenceKind: 'calls' as const,
+            line: 5,
+            column: 4,
+            filePath: 'ui/Main.qml',
+            language: 'qml' as const,
+            candidates: ['MainBarButton::clicked'],
+        };
+
+        // @ts-expect-error — minimal mock
+        expect(qtResolver.resolve(ref, ctx)).toBeNull();
+    });
 
   it('does not resolve non-handler QML references', () => {
     const ctx = {
@@ -510,6 +650,129 @@ describe('qtResolver — QML signal handler resolution', () => {
     const resolved = qtResolver.resolve(ref, ctx);
     expect(resolved).toBeNull();
   });
+});
+
+describe('qtResolver — QML id receiver resolution', () => {
+    const methodNode = (id: string, owner: string) => ({
+        id,
+        kind: 'method' as const,
+        name: 'refresh',
+        qualifiedName: `src/${owner}.h::${owner}::refresh`,
+        filePath: `src/${owner}.h`,
+        language: 'cpp' as const,
+        startLine: 4,
+        endLine: 4,
+        startColumn: 0,
+        endColumn: 30,
+        updatedAt: Date.now(),
+        signature: 'invokable refresh()',
+    });
+
+    const contextFor = (methods: ReturnType<typeof methodNode>[]) => ({
+        getAllFiles: () => ['ui/Main.qml'],
+        readFile: () => null,
+        getNodesInFile: () => [],
+        getNodesByName: (name: string) => (name === 'refresh' ? methods : []),
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        getNodesByLowerName: () => [],
+        fileExists: () => false,
+        getProjectRoot: () => '/tmp',
+        getImportMappings: () => [],
+    });
+
+    const ref = {
+        fromNodeId: 'function-1',
+        referenceName: 'backend.refresh',
+        referenceKind: 'calls' as const,
+        line: 8,
+        column: 8,
+        filePath: 'ui/Main.qml',
+        language: 'qml' as const,
+        candidates: ['qt.qml-id|backend|NativePanel|refresh'],
+    };
+
+    it('resolves only the method owned by the QML id type', () => {
+        const context = contextFor([
+            methodNode('wrong-method', 'OtherPanel'),
+            methodNode('right-method', 'NativePanel'),
+        ]);
+
+        // @ts-expect-error — minimal mock
+        expect(qtResolver.resolve(ref, context)?.targetNodeId).toBe('right-method');
+    });
+
+    it('does not guess when the QML id type has no matching method', () => {
+        const context = contextFor([methodNode('wrong-method', 'OtherPanel')]);
+
+        // @ts-expect-error — minimal mock
+        expect(qtResolver.resolve(ref, context)).toBeNull();
+    });
+});
+
+describe('QmlExtractor — context property calls', () => {
+    it('marks an unshadowed dotted call as a possible Qt context property', () => {
+        const src = `
+import QtQuick
+Item {
+    function updateReport() {
+        reportService.refresh()
+    }
+}
+`.trim();
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const ref = result.unresolvedReferences.find(
+            (candidate) => candidate.referenceName === 'reportService.refresh',
+        );
+        expect(ref?.candidates).toContain('qt.context-property|reportService|refresh');
+    });
+
+    it('does not mark a function parameter as a context property', () => {
+        const src = `
+import QtQuick
+Item {
+    function updateReport(reportService) {
+        reportService.refresh()
+    }
+}
+`.trim();
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const ref = result.unresolvedReferences.find(
+            (candidate) => candidate.referenceName === 'reportService.refresh',
+        );
+        expect(ref?.candidates ?? []).not.toContain('qt.context-property|reportService|refresh');
+    });
+});
+
+describe('QmlExtractor — Component.createObject', () => {
+    it('links a local component factory call to its single child definition', () => {
+        const src = `
+import QtQuick
+Item {
+    Component {
+        id: panelFactory
+        ReportPanel {}
+    }
+    function createPanel(parentItem) {
+        return panelFactory.createObject(parentItem)
+    }
+}
+`.trim();
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const caller = result.nodes.find((node) => node.kind === 'function' && node.name === 'createPanel');
+        const panel = result.nodes.find((node) => node.kind === 'component' && node.name === 'ReportPanel');
+        const root = result.nodes.find((node) => node.kind === 'component' && node.name === 'Main');
+
+        expect(caller).toBeDefined();
+        expect(panel).toBeDefined();
+        expect(root).toBeDefined();
+        expect(result.edges).toContainEqual({ source: root!.id, target: caller!.id, kind: 'contains' });
+        expect(result.edges).toContainEqual({
+            source: caller!.id,
+            target: panel!.id,
+            kind: 'instantiates',
+        });
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -642,6 +905,79 @@ Item {
     expect(member).toBeDefined();
     expect(member!.qualifiedName).toContain('Direction');
   });
+
+    it('links an embedded JS access to a declared local enum member', () => {
+        const src = `
+import QtQuick
+Item {
+    enum Status { Ready, Busy }
+    function initialStatus() {
+        return Status.Ready
+    }
+}
+`.trim();
+        const result = new QmlExtractor('ui/Widget.qml', src).extract();
+        const fn = result.nodes.find((node) => node.kind === 'function' && node.name === 'initialStatus');
+        const member = result.nodes.find(
+            (node) => node.kind === 'enum_member' && node.qualifiedName === 'ui/Widget.qml::Status::Ready',
+        );
+
+        expect(fn).toBeDefined();
+        expect(member).toBeDefined();
+        expect(result.edges).toContainEqual({ source: fn!.id, target: member!.id, kind: 'references' });
+    });
+
+    it('extracts qualified enum accesses from property bindings', () => {
+        const src = `
+import QtQuick
+Item {
+    enum Status { Ready, Busy }
+    property int initialStatus: Status.Ready
+    property int orientation: Qt.Vertical
+    property int ordinaryValue: model.value
+}
+`.trim();
+        const result = new QmlExtractor('ui/Widget.qml', src).extract();
+        const property = result.nodes.find((node) => node.kind === 'property' && node.name === 'initialStatus');
+        const member = result.nodes.find(
+            (node) => node.kind === 'enum_member' && node.qualifiedName === 'ui/Widget.qml::Status::Ready',
+        );
+
+        expect(result.edges).toContainEqual({ source: property!.id, target: member!.id, kind: 'references' });
+        expect(result.unresolvedReferences).toContainEqual(expect.objectContaining({
+            fromNodeId: result.nodes.find((node) => node.name === 'orientation')!.id,
+            referenceName: 'Vertical',
+            referenceKind: 'references',
+            candidates: ['qt.enum-member|Qt|Vertical'],
+        }));
+        expect(result.unresolvedReferences).not.toContainEqual(expect.objectContaining({
+            referenceName: 'value',
+            candidates: ['qt.enum-member|model|value'],
+        }));
+    });
+
+    it('does not guess between duplicate local enum members', () => {
+        const src = `
+import QtQuick
+Item {
+    enum Status { Ready }
+    component Child: Item {
+        enum Status { Ready }
+    }
+    function initialStatus() {
+        return Status.Ready
+    }
+}
+`.trim();
+        const result = new QmlExtractor('ui/Widget.qml', src).extract();
+        const fn = result.nodes.find((node) => node.kind === 'function' && node.name === 'initialStatus');
+        const memberIds = new Set(
+            result.nodes.filter((node) => node.kind === 'enum_member' && node.name === 'Ready').map((node) => node.id),
+        );
+        expect(result.edges.filter(
+            (edge) => edge.source === fn!.id && edge.kind === 'references' && memberIds.has(edge.target),
+        )).toEqual([]);
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -759,7 +1095,7 @@ Item {
     expect(ref!.referenceKind).toBe('calls');
   });
 
-  it('emits a references edge to the attached type', () => {
+    it('does not emit project references for built-in attached types', () => {
     const src = `
 import QtQuick
 Item {
@@ -770,7 +1106,27 @@ Item {
     const ref = result.unresolvedReferences.find(
       (r) => r.referenceName === 'Keys' && r.referenceKind === 'references',
     );
-    expect(ref).toBeDefined();
+      expect(ref).toBeUndefined();
+  });
+
+    it('extracts calls from an arrow-function handler body', () => {
+        const src = `
+import QtQuick
+Item {
+    CustomPanel {
+        onSaved: (value) => {
+            publishValue(value)
+        }
+    }
+}
+`.trim();
+        const result = new QmlExtractor('ui/Form.qml', src).extract();
+        const handler = result.nodes.find((n) => n.name === 'onSaved');
+        const call = result.unresolvedReferences.find(
+            (r) => r.fromNodeId === handler?.id && r.referenceName === 'publishValue',
+        );
+        expect(handler).toBeDefined();
+        expect(call?.referenceKind).toBe('calls');
   });
 
   it('emits a contains edge from parent component to attached handler', () => {
@@ -815,6 +1171,7 @@ signals:
     const alias = nodes.find((n) => n.kind === 'component' && n.name === 'Counter');
     expect(alias).toBeDefined();
     expect(alias!.signature).toContain('QML_NAMED_ELEMENT(Counter)');
+      expect(alias!.signature).toContain('PrivateCounter');
   });
 
   it('component alias node is in the same file as the C++ class', () => {
@@ -823,9 +1180,9 @@ signals:
     expect(alias!.filePath).toBe('src/counter.h');
   });
 
-  it('emits a references relation from the alias to the QML name', () => {
+    it('emits a references relation from the alias to the C++ owner', () => {
     const { references } = qtResolver.extract!('src/counter.h', QT_CPP_NAMED);
-    const ref = references.find((r) => r.referenceName === 'Counter');
+      const ref = references.find((r) => r.referenceName === 'PrivateCounter');
     expect(ref).toBeDefined();
   });
 
@@ -892,6 +1249,28 @@ void registerTypes() {
     const ref = references.find((r) => r.referenceName === 'InternalCounter');
     expect(ref).toBeDefined();
   });
+
+    it.each([
+        ['qmlRegisterType', 'demo::NativeWidget', 'Widget'],
+        ['qmlRegisterSingletonType', 'demo::AppRegistry', 'Registry'],
+        ['qmlRegisterUncreatableType', 'demo::ReadOnlyModel', 'Model'],
+    ])('extracts %s registrations with namespaced C++ types', (registration, cppType, qmlName) => {
+        const extraArgument = registration === 'qmlRegisterUncreatableType' ? ', "read only"' : '';
+        const src = `
+#include <QtQml>
+void registerTypes() {
+    ${registration}<${cppType}>("demo.ui", 1, 0, "${qmlName}"${extraArgument});
+}
+`.trim();
+        const { nodes, references } = qtResolver.extract!('src/register.cpp', src);
+
+        expect(nodes).toEqual(expect.arrayContaining([
+            expect.objectContaining({ kind: 'component', name: qmlName }),
+        ]));
+        expect(references).toEqual(expect.arrayContaining([
+            expect.objectContaining({ referenceName: cppType, referenceKind: 'references' }),
+        ]));
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -926,6 +1305,28 @@ signals:
     const invokable = nodes.filter((n) => n.signature?.startsWith('invokable'));
     expect(invokable.some((n) => n.name === 'notInvokable')).toBe(false);
   });
+
+    it('extracts a Q_INVOKABLE declaration whose parameters span lines', () => {
+        const src = `
+#include <QObject>
+class ReportBridge : public QObject {
+    Q_OBJECT
+public:
+    Q_INVOKABLE void refreshReport(const QString& inputPath,
+                                   const QString& outputPath,
+                                   bool strictMode);
+};
+`.trim();
+        const { nodes } = qtResolver.extract!('src/report-bridge.h', src);
+        const method = nodes.find((node) => node.name === 'refreshReport');
+        expect(method).toMatchObject({
+            kind: 'method',
+            qualifiedName: 'src/report-bridge.h::ReportBridge::refreshReport',
+            signature: expect.stringMatching(/^invokable refreshReport\(/),
+            startLine: 5,
+            endLine: 7,
+        });
+    });
 });
 
 // ---------------------------------------------------------------------------

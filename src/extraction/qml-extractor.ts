@@ -19,9 +19,9 @@
  */
 
 import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference, Language } from '../types';
-import { generateNodeId } from './tree-sitter-helpers';
+import { generateNodeId, getChildByField } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
-import { isLanguageSupported } from './grammars';
+import { getParser, isLanguageSupported } from './grammars';
 
 // Common QtQuick built-in types that are instantiated by users but defined in Qt itself
 const QT_BUILTIN_TYPES = new Set([
@@ -95,6 +95,7 @@ interface ComponentFrame {
   nodeId: string;
   startLine: number;
   typeName: string;
+    ownerName: string;
   qmlId?: string;
 }
 
@@ -105,6 +106,15 @@ export class QmlExtractor {
   private edges: Edge[] = [];
   private unresolvedRefs: UnresolvedReference[] = [];
   private errors: ExtractionError[] = [];
+    private qmlShadowNames = new Set<string>();
+    private jsLocalNames = new Map<string, Set<string>>();
+    private jsMemberAccesses: Array<{
+        sourceNodeId: string;
+        receiver: string;
+        member: string;
+        line: number;
+        column: number;
+    }> = [];
 
   constructor(filePath: string, source: string) {
     this.filePath = filePath;
@@ -140,6 +150,8 @@ export class QmlExtractor {
 
     // Stack of open component frames (one per nesting level)
     const stack: ComponentFrame[] = [];
+      const qmlIdTypes = new Map<string, Set<string>>();
+      const qmlIdNodeIds = new Map<string, Set<string>>();
 
     // The outermost component is named after the .qml file
     const fileName = this.filePath.split(/[/\\]/).pop() ?? this.filePath;
@@ -250,9 +262,16 @@ export class QmlExtractor {
           filePath: this.filePath,
           language: 'qml',
         });
-        stack.push({ nodeId, startLine: lineNum, typeName: inlineName! });
+          stack.push({ nodeId, startLine: lineNum, typeName: inlineName!, ownerName: inlineName! });
         braceBalance++;
         braceDepth.push(lineNum);
+          const inlineBody = line.slice(line.indexOf('{'));
+          if ((inlineBody.match(/\{/g)?.length ?? 0) === (inlineBody.match(/\}/g)?.length ?? 0)) {
+              stack.pop();
+              braceBalance--;
+              braceDepth.pop();
+              node.endLine = lineNum;
+          }
         continue;
       }
 
@@ -282,7 +301,7 @@ export class QmlExtractor {
             updatedAt: Date.now(),
           };
           this.nodes.push(node);
-          stack.push({ nodeId, startLine: lineNum, typeName });
+            stack.push({ nodeId, startLine: lineNum, typeName, ownerName: componentName });
 
           // Emit an `extends` edge: this component extends its root type
           // (unless it's a QtObject or unknown built-in without user interest)
@@ -338,14 +357,27 @@ export class QmlExtractor {
               });
             }
 
-            stack.push({ nodeId, startLine: lineNum, typeName });
+              stack.push({ nodeId, startLine: lineNum, typeName, ownerName: typeName });
           } else {
-            stack.push({ nodeId: parentFrame.nodeId, startLine: lineNum, typeName: '' });
+              stack.push({
+                  nodeId: parentFrame.nodeId,
+                  startLine: lineNum,
+                  typeName: '',
+                  ownerName: parentFrame.ownerName,
+              });
           }
         }
 
         braceBalance++;
         braceDepth.push(lineNum);
+          const componentBody = line.slice(line.indexOf('{'));
+          if ((componentBody.match(/\{/g)?.length ?? 0) === (componentBody.match(/\}/g)?.length ?? 0)) {
+              const frame = stack.pop();
+              braceBalance--;
+              braceDepth.pop();
+              const node = frame && this.nodes.find((candidate) => candidate.id === frame.nodeId);
+              if (node) node.endLine = lineNum;
+          }
         continue;
       }
 
@@ -454,6 +486,12 @@ export class QmlExtractor {
       const idMatch = line.match(RE_ID);
       if (idMatch) {
         currentFrame.qmlId = idMatch[1];
+          const types = qmlIdTypes.get(idMatch[1]!) ?? new Set<string>();
+          types.add(currentFrame.typeName);
+          qmlIdTypes.set(idMatch[1]!, types);
+          const nodeIds = qmlIdNodeIds.get(idMatch[1]!) ?? new Set<string>();
+          nodeIds.add(currentFrame.nodeId);
+          qmlIdNodeIds.set(idMatch[1]!, nodeIds);
         // Patch the node name to include the QML id for clarity
         const node = this.nodes.find((n) => n.id === currentFrame.nodeId);
         if (node && node.name !== componentName) {
@@ -467,6 +505,7 @@ export class QmlExtractor {
       const propMatch = line.match(RE_PROPERTY);
       if (propMatch) {
         const [, propType, propName] = propMatch;
+          this.qmlShadowNames.add(propName!);
         const nodeId = generateNodeId(this.filePath, 'property', propName!, lineNum);
         const node: Node = {
           id: nodeId,
@@ -484,6 +523,10 @@ export class QmlExtractor {
         };
         this.nodes.push(node);
         this.edges.push({ source: currentFrame.nodeId, target: nodeId, kind: 'contains' });
+          const initializerColumn = line.indexOf(':', propMatch[0].length);
+          if (initializerColumn >= 0) {
+              this.extractJsBody(line.slice(initializerColumn + 1), lineNum, nodeId, currentFrame.nodeId);
+          }
         continue;
       }
 
@@ -516,6 +559,13 @@ export class QmlExtractor {
       if (funcMatch) {
         const [, funcName, funcParams] = funcMatch;
         const nodeId = generateNodeId(this.filePath, 'function', funcName!, lineNum);
+          const parameterNames = new Set(
+              (funcParams ?? '')
+                  .split(',')
+                  .map((parameter) => parameter.trim().split('=')[0]!.trim())
+                  .filter((parameter) => /^[A-Za-z_$][\w$]*$/.test(parameter)),
+          );
+          this.jsLocalNames.set(nodeId, parameterNames);
         const node: Node = {
           id: nodeId,
           kind: 'function',
@@ -591,12 +641,12 @@ export class QmlExtractor {
             column: 0,
             filePath: this.filePath,
             language: 'qml',
+              candidates: [`${currentFrame.ownerName}::${signalName}`],
           });
         }
-        // Handle block handler body — treat as JS if followed by {
+          // Handle block and arrow-function handler bodies as embedded JS.
         const braceInLine = rawLine.lastIndexOf('{');
-        if (braceInLine >= 0 && handlerMatch[0].endsWith('{')) {
-          // Multi-line handler body — delegate to JS
+          if (braceInLine >= 0) {
           const handlerNodeId = generateNodeId(this.filePath, 'method', handlerName, lineNum);
           jsFunctionNodeId = handlerNodeId;
           jsFunctionParentId = currentFrame.nodeId;
@@ -652,17 +702,40 @@ export class QmlExtractor {
           column: 0,
           filePath: this.filePath,
           language: 'qml',
+            candidates: [`${attachedType}::${signalName}`],
         });
-        // Also emit reference to the attached type (e.g. Component, Keys)
-        this.unresolvedRefs.push({
-          fromNodeId: nodeId,
-          referenceName: attachedType!,
-          referenceKind: 'references',
-          line: lineNum,
-          column: 0,
-          filePath: this.filePath,
-          language: 'qml',
-        });
+          // Built-in attached types are defined by Qt, not by project components.
+          if (!QT_BUILTIN_TYPES.has(attachedType!)) {
+              this.unresolvedRefs.push({
+                  fromNodeId: nodeId,
+                  referenceName: attachedType!,
+                  referenceKind: 'references',
+                  line: lineNum,
+                  column: 0,
+                  filePath: this.filePath,
+                  language: 'qml',
+              });
+          }
+
+          const braceInLine = rawLine.lastIndexOf('{');
+          if (braceInLine >= 0) {
+              jsFunctionNodeId = nodeId;
+              jsFunctionParentId = currentFrame.nodeId;
+              jsBodyStartLine = lineNum;
+              jsBodyLines = [rawLine.slice(braceInLine)];
+              jsBodyDepth = 1;
+              for (let ci = braceInLine + 1; ci < rawLine.length; ci++) {
+                  if (rawLine[ci] === '{') jsBodyDepth++;
+                  else if (rawLine[ci] === '}') {
+                      jsBodyDepth--;
+                      if (jsBodyDepth === 0) {
+                          this.extractJsBody(jsBodyLines.join('\n'), jsBodyStartLine, nodeId, currentFrame.nodeId);
+                          jsFunctionNodeId = null;
+                          break;
+                      }
+                  }
+              }
+          }
         continue;
       }
 
@@ -686,6 +759,10 @@ export class QmlExtractor {
         }
       }
     }
+
+      this.linkLocalComponentFactories(qmlIdTypes, qmlIdNodeIds);
+      this.annotateQmlMemberReferences(qmlIdTypes);
+      this.linkLocalEnumAccesses();
 
     // Patch root component endLine to cover the whole file
     if (this.nodes.length > 0) {
@@ -735,6 +812,7 @@ export class QmlExtractor {
     const cleanSource = source.replace(/\s+\d+(?:\.\d+)?$/, '').replace(/^["']|["']$/g, '');
     const moduleName = cleanSource;
     const importText = alias ? `import ${source} as ${alias}` : `import ${source}`;
+      if (alias) this.qmlShadowNames.add(alias);
 
     const nodeId = generateNodeId(this.filePath, 'import', moduleName, lineNum);
     const node: Node = {
@@ -770,6 +848,98 @@ export class QmlExtractor {
   // JS body delegation
   // -------------------------------------------------------------------------
 
+    private annotateQmlMemberReferences(qmlIdTypes: Map<string, Set<string>>): void {
+        for (const ref of this.unresolvedRefs) {
+            if (ref.referenceKind !== 'calls') continue;
+            const memberCall = ref.referenceName.match(/^([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)$/);
+            if (!memberCall) continue;
+            const [, receiver, methodName] = memberCall;
+            const types = qmlIdTypes.get(receiver!);
+            let candidate: string;
+            if (types?.size === 1) {
+                const typeName = [...types][0]!;
+                candidate = `qt.qml-id|${receiver}|${typeName}|${methodName}`;
+            } else {
+                if (
+                    types ||
+                    this.qmlShadowNames.has(receiver!) ||
+                    this.jsLocalNames.get(ref.fromNodeId)?.has(receiver!)
+                ) continue;
+                candidate = `qt.context-property|${receiver}|${methodName}`;
+            }
+            if (!ref.candidates?.includes(candidate)) {
+                ref.candidates = [...(ref.candidates ?? []), candidate];
+            }
+        }
+    }
+
+    private linkLocalComponentFactories(
+        qmlIdTypes: Map<string, Set<string>>,
+        qmlIdNodeIds: Map<string, Set<string>>,
+    ): void {
+        const nodesById = new Map(this.nodes.map((node) => [node.id, node]));
+        for (const ref of this.unresolvedRefs) {
+            if (ref.referenceKind !== 'calls') continue;
+            const call = ref.referenceName.match(/^([A-Za-z_$][\w$]*)\.createObject$/);
+            if (!call) continue;
+            const receiver = call[1]!;
+            const types = qmlIdTypes.get(receiver);
+            const factoryNodeIds = qmlIdNodeIds.get(receiver);
+            if (types?.size !== 1 || !types.has('Component') || factoryNodeIds?.size !== 1) continue;
+            const factoryNodeId = [...factoryNodeIds][0]!;
+            const children = this.edges
+                .filter((edge) => edge.kind === 'contains' && edge.source === factoryNodeId)
+                .map((edge) => nodesById.get(edge.target))
+                .filter((node): node is Node => node?.kind === 'component');
+            if (children.length !== 1) continue;
+            this.edges.push({ source: ref.fromNodeId, target: children[0]!.id, kind: 'instantiates' });
+        }
+    }
+
+    private linkLocalEnumAccesses(): void {
+        const members = new Map<string, Node[]>();
+        for (const node of this.nodes) {
+            if (node.kind !== 'enum_member') continue;
+            const parts = node.qualifiedName.split('::');
+            if (parts.length < 3) continue;
+            const key = `${parts.at(-2)}.${parts.at(-1)}`;
+            members.set(key, [...(members.get(key) ?? []), node]);
+        }
+        const emitted = new Set<string>();
+        for (const access of this.jsMemberAccesses) {
+            const targets = members.get(`${access.receiver}.${access.member}`);
+            if (targets) {
+                if (targets.length !== 1) continue;
+                const target = targets[0]!;
+                const key = `${access.sourceNodeId}|${target.id}`;
+                if (emitted.has(key)) continue;
+                emitted.add(key);
+                this.edges.push({ source: access.sourceNodeId, target: target.id, kind: 'references' });
+                continue;
+            }
+            if (
+                this.qmlShadowNames.has(access.receiver) ||
+                this.jsLocalNames.get(access.sourceNodeId)?.has(access.receiver)
+            ) continue;
+            const ownerLeaf = access.receiver.split('.').at(-1)!;
+            if (!/^[A-Z]/.test(ownerLeaf)) continue;
+            const candidate = `qt.enum-member|${access.receiver.replaceAll('.', '::')}|${access.member}`;
+            const key = `${access.sourceNodeId}|${candidate}`;
+            if (emitted.has(key)) continue;
+            emitted.add(key);
+            this.unresolvedRefs.push({
+                fromNodeId: access.sourceNodeId,
+                referenceName: access.member,
+                referenceKind: 'references',
+                line: access.line,
+                column: access.column,
+                filePath: this.filePath,
+                language: 'qml',
+                candidates: [candidate],
+            });
+        }
+    }
+
   private extractJsBody(
     body: string,
     startLine: number,
@@ -782,6 +952,34 @@ export class QmlExtractor {
     try {
       const extractor = new TreeSitterExtractor(this.filePath, body, lang);
       const result = extractor.extract();
+        const parser = getParser(lang);
+        const tree = parser?.parse(body);
+        for (const memberExpression of tree?.rootNode.descendantsOfType('member_expression') ?? []) {
+            if (
+                memberExpression.parent?.type === 'call_expression' ||
+                memberExpression.parent?.type === 'member_expression'
+            ) continue;
+            const receiver = getChildByField(memberExpression, 'object');
+            const member = getChildByField(memberExpression, 'property');
+            if (
+                (receiver?.type !== 'identifier' && receiver?.type !== 'member_expression') ||
+                member?.type !== 'property_identifier' ||
+                !/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(receiver.text)
+            ) continue;
+            this.jsMemberAccesses.push({
+                sourceNodeId: functionNodeId,
+                receiver: receiver.text,
+                member: member.text,
+                line: member.startPosition.row + startLine,
+                column: member.startPosition.column,
+            });
+        }
+
+        const localNames = this.jsLocalNames.get(functionNodeId) ?? new Set<string>();
+        for (const node of result.nodes) {
+            if (node.kind === 'variable' || node.kind === 'parameter') localNames.add(node.name);
+        }
+        this.jsLocalNames.set(functionNodeId, localNames);
 
       for (const ref of result.unresolvedReferences) {
         // Offset lines back to the .qml file positions
