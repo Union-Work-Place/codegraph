@@ -59,8 +59,8 @@ const QT_BUILTIN_TYPES = new Set([
 /** import QtQuick 2.15 / import "path" / import "script.js" as Alias */
 const RE_IMPORT = /^\s*import\s+(.+?)(?:\s+as\s+(\w+))?\s*$/;
 
-/** Component instantiation: TypeName { or Qualified.Type { */
-const RE_COMPONENT = /^\s*([A-Z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*)\s*\{/;
+/** Component instantiation or grouped property: TypeName { or anchors { */
+const RE_COMPONENT = /^\s*([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*)\s*\{/;
 
 /** property [readonly] [required] T name [: value] */
 const RE_PROPERTY = /^\s*(?:(?:readonly|required|default|final|virtual|override)\s+)*property\s+(\S+(?:<[^>]+>)?)\s+(\w+)/;
@@ -96,6 +96,7 @@ interface ComponentFrame {
   startLine: number;
   typeName: string;
     ownerName: string;
+    isGrouping?: boolean;
   qmlId?: string;
 }
 
@@ -364,6 +365,7 @@ export class QmlExtractor {
                   startLine: lineNum,
                   typeName: '',
                   ownerName: parentFrame.ownerName,
+                  isGrouping: true,
               });
           }
         }
@@ -375,7 +377,7 @@ export class QmlExtractor {
               const frame = stack.pop();
               braceBalance--;
               braceDepth.pop();
-              const node = frame && this.nodes.find((candidate) => candidate.id === frame.nodeId);
+              const node = frame && !frame.isGrouping && this.nodes.find((candidate) => candidate.id === frame.nodeId);
               if (node) node.endLine = lineNum;
           }
         continue;
@@ -465,7 +467,7 @@ export class QmlExtractor {
         if (stack.length > 0) {
           const frame = stack[stack.length - 1]!;
           // Patch the endLine of the corresponding node
-          const node = this.nodes.find((n) => n.id === frame.nodeId);
+            const node = frame.isGrouping ? undefined : this.nodes.find((n) => n.id === frame.nodeId);
           if (node && node.endLine === (node.startLine)) {
             node.endLine = lineNum;
           } else if (node && node.endLine > node.startLine) {
@@ -611,11 +613,11 @@ export class QmlExtractor {
       const handlerMatch = line.match(RE_HANDLER);
       if (handlerMatch) {
         const handlerName = handlerMatch[1]!;
+          const handlerNodeId = generateNodeId(this.filePath, 'method', handlerName, lineNum);
         // Skip generic "on" properties that aren't signal handlers
-        if (handlerName.length > 2) {
-          const nodeId = generateNodeId(this.filePath, 'method', handlerName, lineNum);
+          if (handlerName.length > 2) {
           const node: Node = {
-            id: nodeId,
+              id: handlerNodeId,
             kind: 'method',
             name: handlerName,
             qualifiedName: `${this.filePath}::${handlerName}`,
@@ -629,12 +631,12 @@ export class QmlExtractor {
             updatedAt: Date.now(),
           };
           this.nodes.push(node);
-          this.edges.push({ source: currentFrame.nodeId, target: nodeId, kind: 'contains' });
+            this.edges.push({ source: currentFrame.nodeId, target: handlerNodeId, kind: 'contains' });
 
           // Derive the signal name from the handler: onFoo → foo, onFooChanged → fooChanged
           const signalName = handlerName[2]!.toLowerCase() + handlerName.slice(3);
           this.unresolvedRefs.push({
-            fromNodeId: nodeId,
+              fromNodeId: handlerNodeId,
             referenceName: signalName,
             referenceKind: 'calls',
             line: lineNum,
@@ -647,7 +649,6 @@ export class QmlExtractor {
           // Handle block and arrow-function handler bodies as embedded JS.
         const braceInLine = rawLine.lastIndexOf('{');
           if (braceInLine >= 0) {
-          const handlerNodeId = generateNodeId(this.filePath, 'method', handlerName, lineNum);
           jsFunctionNodeId = handlerNodeId;
           jsFunctionParentId = currentFrame.nodeId;
           jsBodyStartLine = lineNum;
@@ -664,6 +665,11 @@ export class QmlExtractor {
               }
             }
           }
+          } else {
+              const colonInLine = rawLine.indexOf(':');
+              if (colonInLine >= 0) {
+                  this.extractJsBody(rawLine.slice(colonInLine + 1), lineNum, handlerNodeId, currentFrame.nodeId);
+              }
         }
         continue;
       }
@@ -734,6 +740,11 @@ export class QmlExtractor {
                           break;
                       }
                   }
+              }
+          } else {
+              const colonInLine = rawLine.indexOf(':');
+              if (colonInLine >= 0) {
+                  this.extractJsBody(rawLine.slice(colonInLine + 1), lineNum, nodeId, currentFrame.nodeId);
               }
           }
         continue;

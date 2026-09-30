@@ -1780,13 +1780,8 @@ export function isCppConstructorDeclaration(node: SyntaxNode): boolean {
  *   that tree-sitter may parse as variable declarations, polluting the symbol table.
  *   Replaced with equal-length spaces to preserve byte offsets.
  *
- * - `signals:` / `Q_SIGNALS:` → `public:` / spaces+`:` (length-preserving):
- *   tree-sitter doesn't know `signals` is an access specifier alias. Replacing it
- *   with `public:` (which is shorter) is not byte-safe, so we blank the keyword
- *   portion and keep the `:`. This leaves `        :` on the line, which tree-sitter
- *   parses as a lone labeled statement, but the actual function declarations that
- *   follow are still extracted by the Qt framework resolver's `extract()` pass,
- *   so no symbols are lost.
+ * - `signals:` / `Q_SIGNALS:` and `slots:` / `Q_SLOTS:` → access specifiers:
+ *   tree-sitter doesn't know Qt's access specifier aliases.
  *
  * - `Q_INVOKABLE` (7 chars → 7 spaces): marks methods visible to QML. Blanking it
  *   lets tree-sitter see a clean return type and extract the method normally.
@@ -1797,8 +1792,10 @@ export function blankQtMacros(source: string): string {
       !source.includes('signals') && !source.includes('Q_SIGNALS') &&
       !source.includes('slots') && !source.includes('Q_SLOTS') &&
       !source.includes('Q_INVOKABLE') &&
+      !source.includes('emit') && !source.includes('Q_EMIT') &&
       !source.includes('QML_ELEMENT') && !source.includes('QML_NAMED_ELEMENT') &&
       !source.includes('QML_SINGLETON') && !source.includes('QML_UNCREATABLE') &&
+      !source.includes('QML_FOREIGN') &&
       !source.includes('QML_INTERFACE') && !source.includes('QML_VALUE_TYPE') &&
       !source.includes('QML_ANONYMOUS')) {
     return source;
@@ -1813,15 +1810,19 @@ export function blankQtMacros(source: string): string {
     .replace(/\bQ_INVOKABLE\b/g, (m) => ' '.repeat(m.length))
     // Blank Q_REQUIRED_RESULT, Q_DECL_OVERRIDE, Q_DECL_FINAL (Qt 4/5 compat macros)
     .replace(/\bQ_(?:REQUIRED_RESULT|DECL_OVERRIDE|DECL_FINAL|DECL_NOEXCEPT|DECL_DEPRECATED(?:_X)?|DECL_UNUSED|DECL_PURE_VIRTUAL)\b/g, (m) => ' '.repeat(m.length))
-    // Blank signals:/Q_SIGNALS: keyword (keep the colon for brace-balance)
-    .replace(/\b(Q_SIGNALS|signals)\s*(?=:)/g, (m) => ' '.repeat(m.length))
-    // Blank slots:/Q_SLOTS: keyword (keep the colon)
-    .replace(/\b(Q_SLOTS|slots)\s*(?=:)/g, (m) => ' '.repeat(m.length))
+      // Rewrite only Qt access specifier aliases, never ordinary identifiers.
+      .replace(/^(\s*)(?:(public|private|protected)\s+)?(Q_SIGNALS|signals)\s*:(?!:)/gm, (m, indent: string, access: string | undefined) => {
+          const visibility = access ?? 'public';
+          return `${indent}${visibility}${' '.repeat(m.length - indent.length - visibility.length - 1)}:`;
+      })
+      .replace(/^(\s*)(?:(public|private|protected)\s+)?(Q_SLOTS|slots)\s*:(?!:)/gm, (_m, indent: string, access: string | undefined) => `${indent}${access ?? 'public'}:`)
+      // `emit` is a Qt macro; blank it so tree-sitter sees the signal invocation.
+      .replace(/\b(?:Q_EMIT|emit)\b(?=\s+[A-Za-z_]\w*\s*\()/g, (m) => ' '.repeat(m.length))
     // Qt 6 QML registration macros — blank with arguments (parenthesised forms)
     // e.g. QML_NAMED_ELEMENT(Counter), QML_UNCREATABLE("reason"), QML_VALUE_TYPE(point)
-    .replace(/\bQML_(?:NAMED_ELEMENT|UNCREATABLE|VALUE_TYPE|ANONYMOUS)\s*\([^)]*\)/g, (m) => ' '.repeat(m.length))
+      .replace(/\bQML_(?:NAMED_ELEMENT|UNCREATABLE|VALUE_TYPE|ANONYMOUS|FOREIGN)\s*\([^)]*\)/g, (m) => ' '.repeat(m.length))
     // Blank zero-arg Qt 6 QML macros
-    .replace(/\bQML_(?:ELEMENT|SINGLETON|INTERFACE|FOREIGN\s*\([^)]*\))\b/g, (m) => ' '.repeat(m.length));
+      .replace(/\bQML_(?:ELEMENT|SINGLETON|INTERFACE)\b/g, (m) => ' '.repeat(m.length));
 }
 
 /**

@@ -651,6 +651,7 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'svelte') return true; // custom extractor (script block delegation)
   if (language === 'vue') return true; // custom extractor (script block delegation)
   if (language === 'astro') return true; // custom extractor (frontmatter/script block delegation)
+    if (language === 'qml') return true; // custom QML extractor (embedded JavaScript delegation)
   if (language === 'liquid') return true; // custom regex extractor
   if (language === 'razor') return true; // custom RazorExtractor (.cshtml/.razor markup)
   if (language === 'yaml') return true; // file-level tracking only; Drupal routing extraction via framework resolver

@@ -163,9 +163,16 @@ function getUniquePointerType(content: string, variableName: string): string | n
         `\\b((?:[A-Za-z_]\\w*\\s*::\\s*)*[A-Za-z_]\\w*)\\s*\\*+\\s*${escapedName}\\b`,
         'g',
     );
+    const autoNewDeclaration = new RegExp(
+        `\\bauto\\s+${escapedName}\\s*=\\s*new\\s+((?:[A-Za-z_]\\w*\\s*::\\s*)*[A-Za-z_]\\w*)\\b`,
+        'g',
+    );
     const types = new Set<string>();
     let match: RegExpExecArray | null;
     while ((match = declaration.exec(content)) !== null) {
+        types.add(match[1]!.replace(/\s*::\s*/g, '::'));
+    }
+    while ((match = autoNewDeclaration.exec(content)) !== null) {
         types.add(match[1]!.replace(/\s*::\s*/g, '::'));
     }
     return types.size === 1 ? [...types][0]! : null;
@@ -464,11 +471,7 @@ function extractQtFromCpp(
       const registration = qmlRegMatch[1]!;
       const cppClass = qmlRegMatch[2]!.replace(/\s*::\s*/g, '::');
       const qmlName = qmlRegMatch[3]!;
-      const cppClassName = cppClass.split('::').pop()!;
-    const lineNum = content.slice(0, qmlRegMatch.index).split('\n').length;
-    // Only create an alias node when the QML name differs from the C++ class name,
-    // since same-name resolution already works via the class node.
-      if (qmlName !== cppClassName) {
+      const lineNum = content.slice(0, qmlRegMatch.index).split('\n').length;
       const nodeId = generateNodeId(filePath, 'component', qmlName, lineNum);
       nodes.push({
         id: nodeId,
@@ -484,7 +487,6 @@ function extractQtFromCpp(
           signature: `${registration}<${cppClass}>("${qmlName}")`,
         updatedAt: Date.now(),
       });
-    }
     // Always emit a reference from the file to the C++ class being registered
     references.push({
       fromNodeId: generateNodeId(filePath, 'file', filePath, 1),
@@ -721,12 +723,14 @@ export const qtResolver: FrameworkResolver = {
           const ownerNames = new Set([qmlIdCall.ownerName]);
           const registeredTypes = getRegisteredOwnerNames(context, qmlIdCall.ownerName);
           if (registeredTypes.size > 1) return null;
+          const hasRegisteredType = registeredTypes.size === 1;
           if (registeredTypes.size === 1) {
               ownerNames.add([...registeredTypes][0]!.split('::').pop()!);
           }
           const candidates = context.getNodesByName(qmlIdCall.methodName).filter((node: Node) => {
               if (node.language === 'qml') {
                   return (
+                      !hasRegisteredType &&
                       (node.kind === 'function' || node.kind === 'method') &&
                       path.basename(node.filePath, path.extname(node.filePath)) === qmlIdCall.ownerName
                   );
@@ -825,6 +829,25 @@ export const qtResolver: FrameworkResolver = {
     // QML component type → C++ class that registered it
     if (ref.language === 'qml' && ref.referenceKind === 'references') {
       const typeName = ref.referenceName;
+        const registeredTypes = getRegisteredOwnerNames(context, typeName);
+        if (registeredTypes.size > 1) return null;
+        if (registeredTypes.size === 1) {
+            const ownerName = [...registeredTypes][0]!.split('::').pop()!;
+            const registeredCandidates = context.getNodesByName(ownerName).filter(
+                (node: Node) =>
+                    node.kind === 'class' &&
+                    (node.language === 'cpp' || node.language === 'c'),
+            );
+            if (registeredCandidates.length === 1) {
+                return {
+                    original: ref,
+                    targetNodeId: registeredCandidates[0]!.id,
+                    confidence: 0.97,
+                    resolvedBy: 'framework',
+                };
+            }
+            return null;
+        }
       const candidates = context.getNodesByName(typeName).filter(
         (n: Node) => n.kind === 'class' || n.kind === 'component',
       );

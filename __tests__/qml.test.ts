@@ -7,6 +7,7 @@
 
 import { beforeAll, describe, it, expect } from 'vitest';
 import { QmlExtractor } from '../src/extraction/qml-extractor';
+import { preloadLanguagesForFiles } from '../src/extraction';
 import { qtResolver } from '../src/resolution/frameworks/qt';
 import {
     detectLanguage,
@@ -38,6 +39,10 @@ describe('QML language detection', () => {
 
     it('loads JavaScript grammar for embedded QML bodies', () => {
         expect(includeEmbeddedGrammarDependencies(['qml'])).toEqual(['qml', 'javascript']);
+    });
+
+    it('preloads JavaScript for QML files', () => {
+        expect(preloadLanguagesForFiles(['ui/Main.qml'])).toEqual(['qml', 'javascript']);
     });
 });
 
@@ -315,6 +320,32 @@ Item {
     expect(typeRef).toBeDefined();
   });
 
+    it('keeps the component stack intact across grouped properties', () => {
+        const src = `
+import QtQuick
+Item {
+    anchors {
+        left: parent.left
+    }
+    Text {
+        onTextChanged: { afterText() }
+    }
+    function afterText() {}
+}
+`.trim();
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const roots = result.nodes.filter((node) => node.kind === 'component' && node.name === 'Main');
+        const text = result.nodes.find((node) => node.kind === 'component' && node.name === 'Text');
+        const handler = result.nodes.find((node) => node.kind === 'method' && node.name === 'onTextChanged');
+        const afterText = result.nodes.find((node) => node.kind === 'function' && node.name === 'afterText');
+
+        expect(roots).toHaveLength(1);
+        expect(text).toBeDefined();
+        expect(handler).toBeDefined();
+        expect(afterText).toBeDefined();
+        expect(result.edges).toContainEqual({ source: text!.id, target: handler!.id, kind: 'contains' });
+    });
+
     it('qualifies calls through an unambiguous QML id with its component type', () => {
         const src = `
 import Demo.Ui
@@ -496,6 +527,24 @@ void expose(QQmlContext *context, Demo::ReportBridge *service) {
     context->setContextProperty("reportService", service);
 }
 `.trim();
+        const { nodes } = qtResolver.extract!('src/bootstrap.cpp', src);
+        expect(nodes).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                kind: 'variable',
+                name: 'reportService',
+                signature: 'qt.context-property|reportService|Demo::ReportBridge',
+            }),
+        ]));
+    });
+
+    it('records a context property backed by an auto new expression', () => {
+        const src = `
+    #include <QQmlContext>
+    void expose(QQmlApplicationEngine &engine) {
+      auto service = new Demo::ReportBridge();
+      engine.rootContext()->setContextProperty("reportService", service);
+    }
+    `.trim();
         const { nodes } = qtResolver.extract!('src/bootstrap.cpp', src);
         expect(nodes).toEqual(expect.arrayContaining([
             expect.objectContaining({
@@ -796,19 +845,42 @@ describe('blankQtMacros', () => {
     expect(result.length).toBe(src.length);
   });
 
-  it('blanks signals: keyword but keeps colon', () => {
+    it('rewrites signals: to a valid access specifier without changing length', () => {
     const src = 'signals:\n    void clicked();\n';
     const result = blankQtMacros(src);
     expect(result).not.toContain('signals');
-    expect(result).toContain(':');
+      expect(result).toContain('public :');
     expect(result.length).toBe(src.length);
   });
 
-  it('blanks Q_SIGNALS: keyword but keeps colon', () => {
+    it('rewrites Q_SIGNALS: to a valid access specifier without changing length', () => {
     const src = 'Q_SIGNALS:\n    void pressed();\n';
     const result = blankQtMacros(src);
     expect(result).not.toContain('Q_SIGNALS');
-    expect(result).toContain(':');
+      expect(result).toContain('public   :');
+      expect(result.length).toBe(src.length);
+  });
+
+    it('rewrites slots: to a valid access specifier', () => {
+        const src = 'slots:\n    void update();\n';
+        const result = blankQtMacros(src);
+        expect(result).toContain('public:');
+    });
+
+    it('leaves ordinary signals and slots expressions unchanged', () => {
+        const src = 'void f() { auto member = signals::value; auto result = ok ? slots : 0; }\n';
+        expect(blankQtMacros(src)).toBe(src);
+    });
+
+    it('blanks emit before a signal invocation', () => {
+        const src = 'void refresh() { emit changed(); }\n';
+        expect(blankQtMacros(src)).toContain('void refresh() {      changed(); }');
+    });
+
+    it('blanks QML_FOREIGN with its argument', () => {
+        const src = 'QML_FOREIGN(ForeignType)\n';
+        const result = blankQtMacros(src);
+        expect(result).not.toContain('QML_FOREIGN');
     expect(result.length).toBe(src.length);
   });
 
@@ -1231,10 +1303,11 @@ void registerTypes() {
 }
 `.trim();
 
-  it('does NOT create a duplicate alias when QML name equals C++ class name', () => {
+    it('creates a component alias when QML name equals C++ class name', () => {
     const { nodes } = qtResolver.extract!('src/register.cpp', SRC_SAME_NAME);
     const aliases = nodes.filter((n) => n.kind === 'component' && n.name === 'Counter');
-    expect(aliases).toHaveLength(0);
+      expect(aliases).toHaveLength(1);
+      expect(aliases[0]!.signature).toContain('qmlRegisterType<Counter>');
   });
 
   it('creates a component alias node when QML name differs from C++ class name', () => {

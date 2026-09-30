@@ -3,11 +3,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
-import { initGrammars, loadAllGrammars } from '../src/extraction/grammars';
+import { initGrammars } from '../src/extraction/grammars';
 
 beforeAll(async () => {
-  await initGrammars();
-  await loadAllGrammars();
+    await initGrammars();
 });
 
 describe('QML persisted signal resolution', () => {
@@ -230,6 +229,64 @@ Item {
     }
   });
 
+    it('resolves block-style and inline QML handlers to an invokable C++ method', async () => {
+        tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-qml-click-handler-'));
+        fs.writeFileSync(
+            path.join(tempDir, 'native-panel.h'),
+            `#include <QObject>
+class NativePanel : public QObject {
+    Q_OBJECT
+public:
+    Q_INVOKABLE void refresh();
+};
+`,
+        );
+        fs.writeFileSync(
+            path.join(tempDir, 'Main.qml'),
+            `import QtQuick
+Item {
+    NativePanel {
+        id: backend
+    }
+    MouseArea {
+        onClicked: {
+            backend.refresh()
+        }
+    }
+    MouseArea {
+      onPressed: backend.refresh()
+    }
+}
+`,
+        );
+
+        const graph = CodeGraph.initSync(tempDir);
+        try {
+            expect((await graph.indexAll()).success).toBe(true);
+            const handler = graph.getNodesInFile('Main.qml').find(
+                (node) => node.kind === 'method' && node.name === 'onClicked',
+            );
+            const inlineHandler = graph.getNodesInFile('Main.qml').find(
+                (node) => node.kind === 'method' && node.name === 'onPressed',
+            );
+            const target = graph.getNodesInFile('native-panel.h').find(
+                (node) => node.kind === 'method' && node.name === 'refresh',
+            );
+
+            expect(handler).toBeDefined();
+            expect(inlineHandler).toBeDefined();
+            expect(target).toBeDefined();
+            expect(graph.getOutgoingEdges(handler!.id)).toEqual(expect.arrayContaining([
+                expect.objectContaining({ kind: 'calls', target: target!.id }),
+            ]));
+            expect(graph.getOutgoingEdges(inlineHandler!.id)).toEqual(expect.arrayContaining([
+                expect.objectContaining({ kind: 'calls', target: target!.id }),
+            ]));
+        } finally {
+            graph.close();
+        }
+    });
+
   it('resolves calls through a QML id to the exact QML component file', async () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-qml-component-id-'));
     fs.writeFileSync(
@@ -318,6 +375,89 @@ Item {
       graph.close();
     }
   });
+
+    it('prefers a same-name registered C++ type over a local QML component', async () => {
+        tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-qml-same-name-registration-'));
+        fs.writeFileSync(
+            path.join(tempDir, 'file-analyzer.h'),
+            `#include <QObject>
+class FileAnalyzer : public QObject {
+    Q_OBJECT
+public:
+    Q_INVOKABLE void refresh();
+};
+`,
+        );
+        fs.writeFileSync(
+            path.join(tempDir, 'registration.cpp'),
+            `#include <QtQml>
+void registerTypes() {
+    qmlRegisterType<FileAnalyzer>("Demo.Ui", 1, 0, "FileAnalyzer");
+}
+`,
+        );
+        fs.writeFileSync(
+            path.join(tempDir, 'FileAnalyzer.qml'),
+            'import QtQuick\nItem {\n    function refresh() {}\n}\n',
+        );
+        fs.writeFileSync(
+            path.join(tempDir, 'Main.qml'),
+            `import Demo.Ui
+Item {
+    FileAnalyzer {
+        id: analyzer
+    }
+    function update() {
+        analyzer.refresh()
+    }
+}
+`,
+        );
+
+        const graph = CodeGraph.initSync(tempDir);
+        try {
+            expect((await graph.indexAll()).success).toBe(true);
+            const mainRoot = graph.getNodesInFile('Main.qml').find(
+                (node) => node.kind === 'component' && node.name === 'Main',
+            );
+            const cppClass = graph.getNodesInFile('file-analyzer.h').find(
+                (node) => node.kind === 'class' && node.name === 'FileAnalyzer',
+            );
+            const qmlComponent = graph.getNodesInFile('FileAnalyzer.qml').find(
+                (node) => node.kind === 'component' && node.name === 'FileAnalyzer',
+            );
+            const caller = graph.getNodesInFile('Main.qml').find(
+                (node) => node.kind === 'function' && node.name === 'update',
+            );
+            const cppMethod = graph.getNodesInFile('file-analyzer.h').find(
+                (node) => node.kind === 'method' && node.name === 'refresh',
+            );
+            const qmlMethod = graph.getNodesInFile('FileAnalyzer.qml').find(
+                (node) => node.kind === 'function' && node.name === 'refresh',
+            );
+
+            expect(mainRoot).toBeDefined();
+            expect(cppClass).toBeDefined();
+            expect(qmlComponent).toBeDefined();
+            expect(caller).toBeDefined();
+            expect(cppMethod).toBeDefined();
+            expect(qmlMethod).toBeDefined();
+            expect(graph.getOutgoingEdges(mainRoot!.id)).toEqual(expect.arrayContaining([
+                expect.objectContaining({ kind: 'references', target: cppClass!.id }),
+            ]));
+            expect(graph.getOutgoingEdges(mainRoot!.id)).not.toEqual(expect.arrayContaining([
+                expect.objectContaining({ kind: 'references', target: qmlComponent!.id }),
+            ]));
+            expect(graph.getOutgoingEdges(caller!.id)).toEqual(expect.arrayContaining([
+                expect.objectContaining({ kind: 'calls', target: cppMethod!.id }),
+            ]));
+            expect(graph.getOutgoingEdges(caller!.id)).not.toEqual(expect.arrayContaining([
+                expect.objectContaining({ kind: 'calls', target: qmlMethod!.id }),
+            ]));
+        } finally {
+            graph.close();
+        }
+    });
 
   it('resolves a registered QML signal handler through its type alias', async () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-qml-signal-alias-'));
@@ -490,4 +630,25 @@ Item {
       graph.close();
     }
   });
+
+    it('reindexes a modified QML file during sync', async () => {
+        tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-qml-sync-'));
+        const filePath = path.join(tempDir, 'Main.qml');
+        fs.writeFileSync(filePath, 'import QtQuick\nItem {\n    function original() {}\n}\n');
+
+        const graph = CodeGraph.initSync(tempDir);
+        try {
+            expect((await graph.indexAll()).success).toBe(true);
+            expect(graph.searchNodes('original')).toHaveLength(1);
+
+            fs.writeFileSync(filePath, 'import QtQuick\nItem {\n    function updated() {}\n}\n');
+
+            const result = await graph.sync();
+            expect(result.filesModified).toBe(1);
+            expect(graph.searchNodes('original')).toHaveLength(0);
+            expect(graph.searchNodes('updated')).toHaveLength(1);
+        } finally {
+            graph.close();
+        }
+    });
 });
