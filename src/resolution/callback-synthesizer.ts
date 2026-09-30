@@ -40,6 +40,8 @@ import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequest
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { crossesCodeBoundary } from './name-matcher';
+import { maskCppNonCode } from '../extraction/languages/c-cpp';
+import { qtExecutableTarget } from './frameworks/qt';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -490,7 +492,7 @@ async function qtSignalChannelEdges(queries: QueryBuilder, ctx: ResolutionContex
     for (const method of queries.iterateNodesByKindIn('method', QT_CPP_LANGUAGES)) {
         if ((++scanned & 255) === 0) await onYield();
         const content = ctx.readFile(method.filePath);
-        const source = content && sliceLines(content, method.startLine, method.endLine);
+        const source = content && sliceLines(maskCppNonCode(content), method.startLine, method.endLine);
         if (!source || !source.includes('emit')) continue;
         const owner = qtEmitterOwner(method, source);
         if (!owner) continue;
@@ -511,8 +513,9 @@ async function qtSignalChannelEdges(queries: QueryBuilder, ctx: ResolutionContex
     for (const filePath of ctx.getAllFiles()) {
         if ((++scannedFiles & 31) === 0) await onYield();
         if (!QT_CPP_FILE_RE.test(filePath)) continue;
-        const source = ctx.readFile(filePath);
-        if (!source || !source.includes('connect')) continue;
+        const content = ctx.readFile(filePath);
+        if (!content || !content.includes('connect')) continue;
+        const source = maskCppNonCode(content);
         const lineAt = makeLineAt(source, 1);
 
         QT_CONNECT_MACRO_RE.lastIndex = 0;
@@ -524,7 +527,7 @@ async function qtSignalChannelEdges(queries: QueryBuilder, ctx: ResolutionContex
             const signal = uniqueQtMember(signals, signalOwner, macro[2]!);
             const slot = uniqueQtMember(slots, slotOwner, macro[4]!);
             if (!signal || !slot) continue;
-            add(signal, slot, lineAt(macro.index), {
+            add(signal, qtExecutableTarget(slot, ctx), lineAt(macro.index), {
                 synthesizedBy: 'qt-signal-channel', channel: 'qt-signal', signal: signal.name, owner: signalOwner,
                 connection: 'SIGNAL/SLOT', registeredAt: `${filePath}:${lineAt(macro.index)}`,
             });
@@ -538,7 +541,7 @@ async function qtSignalChannelEdges(queries: QueryBuilder, ctx: ResolutionContex
             const signal = uniqueQtMember(signals, signalOwner, pointer[2]!);
             const slot = uniqueQtMember(slots, slotOwner, pointer[4]!);
             if (!signal || !slot) continue;
-            add(signal, slot, lineAt(pointer.index), {
+            add(signal, qtExecutableTarget(slot, ctx), lineAt(pointer.index), {
                 synthesizedBy: 'qt-signal-channel', channel: 'qt-signal', signal: signal.name, owner: signalOwner,
                 connection: 'pointer', registeredAt: `${filePath}:${lineAt(pointer.index)}`,
             });

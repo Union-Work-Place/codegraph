@@ -530,6 +530,30 @@ export function blankMetalAttributes(source: string): string {
   return source.replace(METAL_ATTRIBUTE_RE, (m) => ' '.repeat(m.length));
 }
 
+const CPP_NON_CODE_RE = /\/\/(?:\\(?:\r\n|[\r\n])|[^\r\n])*|\/\*[\s\S]*?(?:\*\/|$)|\b(?:u8|[LuU])?R"([^ \t\v\f\r\n()\\]{0,16})\(|(?:\b(?:u8|[LuU]))?"(?:\\[\s\S]|[^"\\])*(?:"|$)|(?<!\w)(?:u8|[LuU])?'(?:\\[\s\S]|[^'\\])*(?:'|$)/g;
+
+/** Mask comments and literals for scanning, preserving UTF-16 length and CR/LF offsets. */
+export function maskCppNonCode(source: string): string {
+    const re = new RegExp(CPP_NON_CODE_RE.source, 'g');
+    const parts: string[] = [];
+    let last = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(source)) !== null) {
+        let end = re.lastIndex;
+        if (match[1] !== undefined) {
+            const closer = `)${match[1]}"`;
+            const close = source.indexOf(closer, end);
+            end = close < 0 ? source.length : close + closer.length;
+            re.lastIndex = end;
+        }
+        parts.push(source.slice(last, match.index), source.slice(match.index, end).replace(/[^\r\n]/g, ' '));
+        last = end;
+    }
+    if (last === 0) return source;
+    parts.push(source.slice(last));
+    return parts.join('');
+}
+
 /**
  * Hide C++ raw literals from the offset-preserving preParse scans (#1505).
  * Neither macro-shaped text in a raw body nor its `)delim"` closer is code.
@@ -544,7 +568,7 @@ export function maskCppRawStrings(source: string): { source: string; restore: (b
   if (source.indexOf('R"') === -1) return unchanged;
   // Skip comments and ordinary literals before looking for a raw opener. The
   // char-literal boundary leaves numeric digit separators (1'000) alone.
-  const re = /\/\/[^\r\n]*|\/\*[\s\S]*?(?:\*\/|$)|\b(?:u8|[LuU])?R"([^ \t\v\f\r\n()\\]{0,16})\(|"(?:\\[\s\S]|[^"\\])*(?:"|$)|(?<!\w)(?:u8|[LuU])?'(?:\\[\s\S]|[^'\\])*(?:'|$)/g;
+    const re = new RegExp(CPP_NON_CODE_RE.source, 'g');
   const spans: Array<{ start: number; end: number }> = [];
   const parts: string[] = [];
   let last = 0;
@@ -645,6 +669,8 @@ export function blankCppAnnotationMacroCalls(source: string): string {
       }
     }
     if (end < 0) continue;
+      if (/^QML_(?:NAMED_ELEMENT|UNCREATABLE|VALUE_TYPE|ANONYMOUS|FOREIGN)$/.test(m[2] as string) &&
+          /[^\x00-\x7f]/.test(source.slice(macroStart, end))) continue;
     let j = end;
     while (j < source.length && /\s/.test(source[j] as string)) j++;
     const after = source[j];
@@ -1780,8 +1806,8 @@ export function isCppConstructorDeclaration(node: SyntaxNode): boolean {
  *   that tree-sitter may parse as variable declarations, polluting the symbol table.
  *   Replaced with equal-length spaces to preserve byte offsets.
  *
- * - `signals:` / `Q_SIGNALS:` and `slots:` / `Q_SLOTS:` → access specifiers:
- *   tree-sitter doesn't know Qt's access specifier aliases.
+ * - `signals:` / `Q_SIGNALS:` become access specifiers; slot aliases are blanked
+ *   without shortening existing access headers or lengthening bare `slots:`.
  *
  * - `Q_INVOKABLE` (7 chars → 7 spaces): marks methods visible to QML. Blanking it
  *   lets tree-sitter see a clean return type and extract the method normally.
@@ -1789,9 +1815,11 @@ export function isCppConstructorDeclaration(node: SyntaxNode): boolean {
 export function blankQtMacros(source: string): string {
   // Fast path: not a Qt file
   if (!source.includes('Q_OBJECT') && !source.includes('Q_GADGET') &&
+      !source.includes('Q_NAMESPACE') &&
       !source.includes('signals') && !source.includes('Q_SIGNALS') &&
       !source.includes('slots') && !source.includes('Q_SLOTS') &&
-      !source.includes('Q_INVOKABLE') &&
+      !source.includes('Q_INVOKABLE') && !source.includes('Q_REQUIRED_RESULT') &&
+      !source.includes('Q_DECL_') &&
       !source.includes('emit') && !source.includes('Q_EMIT') &&
       !source.includes('QML_ELEMENT') && !source.includes('QML_NAMED_ELEMENT') &&
       !source.includes('QML_SINGLETON') && !source.includes('QML_UNCREATABLE') &&
@@ -1801,28 +1829,57 @@ export function blankQtMacros(source: string): string {
     return source;
   }
 
-  return source
-    // Blank zero-arg class macros (preserve byte count)
-    .replace(/\bQ_OBJECT\b/g, (m) => ' '.repeat(m.length))
-    .replace(/\bQ_GADGET\b/g, (m) => ' '.repeat(m.length))
-    .replace(/\bQ_NAMESPACE\b/g, (m) => ' '.repeat(m.length))
-    // Blank Q_INVOKABLE (return type follows immediately after — keep the space)
-    .replace(/\bQ_INVOKABLE\b/g, (m) => ' '.repeat(m.length))
-    // Blank Q_REQUIRED_RESULT, Q_DECL_OVERRIDE, Q_DECL_FINAL (Qt 4/5 compat macros)
-    .replace(/\bQ_(?:REQUIRED_RESULT|DECL_OVERRIDE|DECL_FINAL|DECL_NOEXCEPT|DECL_DEPRECATED(?:_X)?|DECL_UNUSED|DECL_PURE_VIRTUAL)\b/g, (m) => ' '.repeat(m.length))
-      // Rewrite only Qt access specifier aliases, never ordinary identifiers.
-      .replace(/^(\s*)(?:(public|private|protected)\s+)?(Q_SIGNALS|signals)\s*:(?!:)/gm, (m, indent: string, access: string | undefined) => {
-          const visibility = access ?? 'public';
-          return `${indent}${visibility}${' '.repeat(m.length - indent.length - visibility.length - 1)}:`;
-      })
-      .replace(/^(\s*)(?:(public|private|protected)\s+)?(Q_SLOTS|slots)\s*:(?!:)/gm, (_m, indent: string, access: string | undefined) => `${indent}${access ?? 'public'}:`)
-      // `emit` is a Qt macro; blank it so tree-sitter sees the signal invocation.
-      .replace(/\b(?:Q_EMIT|emit)\b(?=\s+[A-Za-z_]\w*\s*\()/g, (m) => ' '.repeat(m.length))
-    // Qt 6 QML registration macros — blank with arguments (parenthesised forms)
-    // e.g. QML_NAMED_ELEMENT(Counter), QML_UNCREATABLE("reason"), QML_VALUE_TYPE(point)
-      .replace(/\bQML_(?:NAMED_ELEMENT|UNCREATABLE|VALUE_TYPE|ANONYMOUS|FOREIGN)\s*\([^)]*\)/g, (m) => ' '.repeat(m.length))
-    // Blank zero-arg Qt 6 QML macros
-      .replace(/\bQML_(?:ELEMENT|SINGLETON|INTERFACE)\b/g, (m) => ' '.repeat(m.length));
+    const masked = maskCppNonCode(source);
+    const chars = source.split('');
+    const blank = (start: number, end: number): void => {
+        for (let offset = start; offset < end; offset++) {
+            const char = source[offset] as string;
+            if (char !== '\r' && char !== '\n' && char.charCodeAt(0) < 128) chars[offset] = ' ';
+        }
+    };
+    const argumentMacros = /\bQML_(?:NAMED_ELEMENT|UNCREATABLE|VALUE_TYPE|ANONYMOUS|FOREIGN)\s*\(/g;
+    let match: RegExpExecArray | null;
+    while ((match = argumentMacros.exec(masked)) !== null) {
+        let depth = 1;
+        let end = argumentMacros.lastIndex;
+        for (; end < masked.length && depth > 0; end++) {
+            if (masked[end] === '(') depth++;
+            else if (masked[end] === ')') depth--;
+        }
+        if (depth !== 0) continue;
+        const hasUnicode = /[^\x00-\x7f]/.test(source.slice(match.index, end));
+        if (hasUnicode && !/^[\x00-\x09\x0b\x0c\x0e-\x7f]{2}$/.test(source.slice(end - 2, end))) {
+            argumentMacros.lastIndex = end;
+            continue;
+        }
+        blank(match.index, end);
+        if (hasUnicode) {
+            chars[match.index] = '/';
+            chars[match.index + 1] = '*';
+            chars[end - 2] = '*';
+            chars[end - 1] = '/';
+        }
+        argumentMacros.lastIndex = end;
+    }
+    for (const token of masked.matchAll(/\b(?:Q_(?:OBJECT|GADGET|NAMESPACE|INVOKABLE|REQUIRED_RESULT|DECL_OVERRIDE|DECL_FINAL|DECL_NOEXCEPT|DECL_DEPRECATED(?:_X)?|DECL_UNUSED|DECL_PURE_VIRTUAL)|QML_(?:ELEMENT|SINGLETON|INTERFACE))\b/g)) {
+        blank(token.index, token.index + token[0].length);
+    }
+    for (const header of masked.matchAll(/^([ \t]*)(?:(public|private|protected)[ \t]+)?(Q_SIGNALS|signals|Q_SLOTS|slots)[ \t]*:(?!:)/gm)) {
+        const alias = header[3] as string;
+        const start = header.index + header[0].lastIndexOf(alias);
+        blank(start, start + alias.length);
+        if (header[2] === undefined) {
+            if (alias === 'signals' || alias === 'Q_SIGNALS') {
+                for (let offset = 0; offset < 'public'.length; offset++) chars[start + offset] = 'public'[offset] as string;
+            } else {
+                chars[header.index + header[0].length - 1] = ' ';
+            }
+        }
+    }
+    for (const token of masked.matchAll(/\b(?:Q_EMIT|emit)\b(?=\s+[A-Za-z_]\w*\s*\()/g)) {
+        blank(token.index, token.index + token[0].length);
+    }
+    return chars.join('');
 }
 
 /**

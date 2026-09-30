@@ -111,6 +111,43 @@ Item {}
 });
 
 describe('QmlExtractor — root component', () => {
+    it('uses the file component as the root id call and signal owner', () => {
+        const src = `import QtQuick
+Item {
+  id: root
+  signal changed()
+  function refresh() {}
+  function run() { root.refresh() }
+  Connections {
+    target: root
+    function onChanged() { refresh() }
+  }
+}`;
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        expect(result.unresolvedReferences).toContainEqual(expect.objectContaining({
+            referenceName: 'root.refresh', candidates: ['qt.qml-id|root|Main|refresh'],
+        }));
+        expect(result.unresolvedReferences).toContainEqual(expect.objectContaining({
+            referenceName: 'changed', referenceKind: 'references', candidates: ['Main::changed'],
+        }));
+        const call = result.unresolvedReferences.find((reference) => reference.referenceName === 'root.refresh');
+        const refresh = result.nodes.find((node) => node.kind === 'function' && node.name === 'refresh');
+        const context = {
+            getAllFiles: () => ['ui/Main.qml'],
+            readFile: (filePath: string) => filePath === 'ui/Main.qml' ? src : null,
+            getNodesInFile: (filePath: string) => result.nodes.filter((node) => node.filePath === filePath),
+            getNodesByName: (name: string) => result.nodes.filter((node) => node.name === name),
+            getNodesByQualifiedName: (name: string) => result.nodes.filter((node) => node.qualifiedName === name),
+            getNodesByKind: (kind: string) => result.nodes.filter((node) => node.kind === kind),
+            getNodesByLowerName: (name: string) => result.nodes.filter((node) => node.name.toLowerCase() === name),
+            fileExists: () => false,
+            getProjectRoot: () => '/tmp',
+            getImportMappings: () => [],
+        };
+        expect(refresh).toBeDefined();
+        expect(qtResolver.resolve(call!, context)?.targetNodeId).toBe(refresh!.id);
+    });
+
   it('creates a component node named after the .qml file', () => {
     const src = `
 import QtQuick
@@ -137,6 +174,44 @@ Rectangle {
 });
 
 describe('QmlExtractor — property declarations', () => {
+    it('collects multiline object and block bindings without losing the following function', () => {
+        const src = `import QtQuick
+Item {
+  property var data: ({
+    nested: { value: service.read() }
+  })
+  property int count: {
+    if (data.nested) { service.count() }
+    return 1
+  }
+  visible: {
+    if (count) { service.check() }
+    return true
+  }
+  function refresh() { service.refresh() }
+}`;
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const root = result.nodes.find((node) => node.kind === 'component' && node.isExported);
+        const data = result.nodes.find((node) => node.kind === 'property' && node.name === 'data');
+        const count = result.nodes.find((node) => node.kind === 'property' && node.name === 'count');
+        const refresh = result.nodes.find((node) => node.kind === 'function' && node.name === 'refresh');
+
+        expect(result.errors).toEqual([]);
+        expect(data).toMatchObject({ startLine: 3, endLine: 5 });
+        expect(count).toMatchObject({ startLine: 6, endLine: 9 });
+        expect(refresh).toBeDefined();
+        for (const child of [data, count, refresh]) {
+            expect(result.edges).toContainEqual({ source: root!.id, target: child!.id, kind: 'contains' });
+        }
+        for (const [referenceName, owner] of [
+            ['service.read', data], ['service.count', count], ['service.check', root], ['service.refresh', refresh],
+        ] as const) {
+            expect(result.unresolvedReferences).toContainEqual(expect.objectContaining({
+                fromNodeId: owner!.id, referenceName, referenceKind: 'calls',
+            }));
+        }
+    });
+
   it('extracts a simple property', () => {
     const src = `
 import QtQuick
@@ -217,6 +292,93 @@ Item {
 });
 
 describe('QmlExtractor — signal handler bindings', () => {
+    it.each(['function onChanged(value)', 'onChanged:'])(
+        'delays %s until its literal local target and id are known',
+        (declaration) => {
+            const src = `import QtQuick
+Item {
+  Connections {
+    ${declaration} {
+      publishValue()
+    }
+    target: backend
+  }
+  NativePanel {
+    id: backend
+  }
+}`;
+            const result = new QmlExtractor('ui/Main.qml', src).extract();
+            const handler = result.nodes.find((node) => node.name === 'onChanged');
+            const associations = result.unresolvedReferences.filter(
+                (reference) => reference.fromNodeId === handler?.id && reference.referenceKind === 'references',
+            );
+
+            expect(handler).toMatchObject({
+                kind: 'method', startLine: 4, endLine: 6, endColumn: src.split('\n')[5]!.indexOf('}') + 1,
+            });
+            expect(associations).toEqual([expect.objectContaining({
+                referenceName: 'changed', candidates: ['NativePanel::changed'],
+            })]);
+        },
+    );
+
+    it.each(['function onChanged(value)', 'onChanged:'])(
+        'marks %s with a delayed literal context signal candidate',
+        (declaration) => {
+            const src = `import QtQuick
+Item {
+  Connections {
+    ${declaration} {
+      publishValue()
+    }
+    target: reportService
+  }
+}`;
+            const result = new QmlExtractor('ui/Main.qml', src).extract();
+            const handler = result.nodes.find((node) => node.name === 'onChanged');
+            const associations = result.unresolvedReferences.filter(
+                (reference) => reference.fromNodeId === handler?.id && reference.referenceKind === 'references',
+            );
+
+            expect(associations).toEqual([expect.objectContaining({
+                referenceName: 'changed', candidates: ['qt.context-signal|reportService|changed'],
+            })]);
+        },
+    );
+
+    it.each([
+        ['condition ? backend : other', '', ''],
+        ['backend', '    property var backend\n', ''],
+        ['backend', '', 'import "backend.js" as backend\n'],
+        ['backend', '    NativePanel {\n        id: backend\n    }\n    NativePanel {\n        id: backend\n    }\n', ''],
+        ['backend', '    NativePanel {\n        id: backend\n    }\n    OtherPanel {\n        id: backend\n    }\n', ''],
+    ])('leaves both Connections syntaxes unresolved for target %s with shadows or ambiguity', (target, setup, imports) => {
+        const src = `import QtQuick
+${imports}Item {
+${setup}    Connections {
+    function onChanged(value) {
+      publishValue()
+    }
+    target: ${target}
+  }
+  Connections {
+    onChanged: {
+      publishValue()
+    }
+    target: ${target}
+  }
+}`;
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const handlers = result.nodes.filter((node) => node.name === 'onChanged');
+
+        expect(handlers).toHaveLength(2);
+        for (const handler of handlers) {
+            expect(result.unresolvedReferences.filter(
+                (reference) => reference.fromNodeId === handler.id && reference.referenceKind === 'references',
+            )).toEqual([]);
+        }
+    });
+
   it('extracts an onClicked handler', () => {
     const src = `
 import QtQuick
@@ -261,6 +423,38 @@ Item {
 });
 
 describe('QmlExtractor — function declarations', () => {
+    it('includes the closing brace in multiline function and handler ranges', () => {
+        const src = `import QtQuick
+Item {
+  function refresh() {
+    if (ready) { service.refresh() }
+  }
+  onVisibleChanged: {
+    service.update()
+  }
+  Component.onCompleted: {
+    service.start()
+  }
+  Connections {
+    target: service
+    function onChanged(value) {
+      service.consume(value)
+    }
+  }
+}`;
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        for (const [name, startLine, endLine] of [
+            ['refresh', 3, 5], ['onVisibleChanged', 6, 8], ['Component.onCompleted', 9, 11], ['onChanged', 14, 16],
+        ] as const) {
+            const node = result.nodes.find((candidate) => candidate.name === name);
+            const closingLine = src.split('\n')[endLine - 1]!;
+            expect(node).toMatchObject({ startLine, endLine, endColumn: closingLine.indexOf('}') + 1 });
+        }
+        expect(result.unresolvedReferences).toContainEqual(expect.objectContaining({
+            referenceName: 'service.consume', line: 15,
+        }));
+    });
+
   it('extracts a function node', () => {
     const src = `
 import QtQuick
@@ -329,6 +523,62 @@ Item {
 });
 
 describe('QmlExtractor — nested components', () => {
+    it('keeps bound objects, siblings and a following function under one file root', () => {
+        const src = `import QtQuick
+Item {
+  background: Rectangle {
+    color: "red"
+    MouseArea {
+      onClicked: {
+        if (enabled) { backend.refresh() }
+      } }
+  }
+  contentItem: Item {}
+  Text {}
+  function refresh() {}
+}`;
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const roots = result.nodes.filter((node) => node.kind === 'component' && node.isExported);
+        const rectangle = result.nodes.find((node) => node.kind === 'component' && node.name === 'Rectangle');
+        const mouse = result.nodes.find((node) => node.kind === 'component' && node.name === 'MouseArea');
+        const content = result.nodes.find((node) => node.kind === 'component' && node.name === 'Item');
+        const text = result.nodes.find((node) => node.kind === 'component' && node.name === 'Text');
+        const refresh = result.nodes.find((node) => node.kind === 'function' && node.name === 'refresh');
+
+        expect(result.errors).toEqual([]);
+        expect(roots).toHaveLength(1);
+        expect(rectangle).toMatchObject({ startLine: 3, endLine: 9 });
+        expect(mouse).toMatchObject({ startLine: 5, endLine: 8 });
+        for (const child of [rectangle, content, text, refresh]) {
+            expect(child).toBeDefined();
+            expect(result.edges).toContainEqual({ source: roots[0]!.id, target: child!.id, kind: 'contains' });
+        }
+        expect(result.edges).toContainEqual({ source: rectangle!.id, target: mouse!.id, kind: 'contains' });
+    });
+
+    it('closes multiple component frames on the same line', () => {
+        const src = `import QtQuick
+Item {
+  Rectangle {
+    MouseArea {
+    } }
+  Text {}
+  function refresh() {}
+}`;
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const root = result.nodes.find((node) => node.kind === 'component' && node.isExported);
+        const text = result.nodes.find((node) => node.kind === 'component' && node.name === 'Text');
+        const refresh = result.nodes.find((node) => node.kind === 'function' && node.name === 'refresh');
+
+        expect(text).toBeDefined();
+        expect(refresh).toBeDefined();
+        for (const child of [text, refresh]) {
+            expect(result.edges).toContainEqual({ source: root!.id, target: child!.id, kind: 'contains' });
+        }
+        expect(result.nodes.find((node) => node.name === 'Rectangle')?.endLine).toBe(5);
+        expect(result.nodes.find((node) => node.name === 'MouseArea')?.endLine).toBe(5);
+    });
+
   it('extracts nested component instantiation', () => {
     const src = `
 import QtQuick
@@ -807,6 +1057,58 @@ describe('qtResolver — QML id receiver resolution', () => {
 });
 
 describe('QmlExtractor — context property calls', () => {
+    it('checks parameters and locals before annotating an existing QML id', () => {
+        const src = `import QtQuick
+Item {
+  NativePanel {
+    id: backend
+  }
+  function run(backend) {
+    backend.refresh()
+  }
+  function localRun() {
+    const backend = localService
+    backend.refresh()
+  }
+  function refreshPanel() {
+    backend.refresh()
+  }
+}`;
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        for (const name of ['run', 'localRun', 'refreshPanel']) {
+            const owner = result.nodes.find((node) => node.kind === 'function' && node.name === name);
+            const ref = result.unresolvedReferences.find(
+                (reference) => reference.fromNodeId === owner?.id && reference.referenceName === 'backend.refresh',
+            );
+            expect(ref).toBeDefined();
+            if (name === 'refreshPanel') {
+                expect(ref?.candidates).toEqual(['qt.qml-id|backend|NativePanel|refresh']);
+            } else {
+                expect(ref?.candidates ?? []).not.toContain('qt.qml-id|backend|NativePanel|refresh');
+                expect(ref?.candidates ?? []).not.toContain('qt.context-property|backend|refresh');
+            }
+        }
+    });
+
+    it('does not annotate duplicate ids even when they share a type', () => {
+        const src = `import QtQuick
+Item {
+  NativePanel {
+    id: backend
+  }
+  NativePanel {
+    id: backend
+  }
+  function run() { backend.refresh() }
+}`;
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const ref = result.unresolvedReferences.find((reference) => reference.referenceName === 'backend.refresh');
+
+        expect(ref).toBeDefined();
+        expect(ref?.candidates ?? []).not.toContain('qt.qml-id|backend|NativePanel|refresh');
+        expect(ref?.candidates ?? []).not.toContain('qt.context-property|backend|refresh');
+    });
+
     it('marks an unshadowed dotted call as a possible Qt context property', () => {
         const src = `
 import QtQuick
@@ -841,6 +1143,28 @@ Item {
 });
 
 describe('QmlExtractor — Component.createObject', () => {
+    it('preserves the actual Component type independently of a root id owner', () => {
+        const src = `import QtQuick
+Component {
+  id: panelFactory
+  ReportPanel {
+    function createPanel(parentItem) {
+      return panelFactory.createObject(parentItem)
+    }
+  }
+}`;
+        const result = new QmlExtractor('ui/PanelFactory.qml', src).extract();
+        const caller = result.nodes.find((node) => node.name === 'createPanel');
+        const panel = result.nodes.find((node) => node.kind === 'component' && node.name === 'ReportPanel');
+
+        expect(caller).toBeDefined();
+        expect(panel).toBeDefined();
+        expect(result.edges).toContainEqual({ source: caller!.id, target: panel!.id, kind: 'instantiates' });
+        expect(result.unresolvedReferences).toContainEqual(expect.objectContaining({
+            referenceName: 'panelFactory.createObject', candidates: ['qt.qml-id|panelFactory|PanelFactory|createObject'],
+        }));
+    });
+
     it('links a local component factory call to its single child definition', () => {
         const src = `
 import QtQuick
@@ -908,10 +1232,71 @@ describe('blankQtMacros', () => {
       expect(result.length).toBe(src.length);
   });
 
-    it('rewrites slots: to a valid access specifier', () => {
-        const src = 'slots:\n    void update();\n';
+    it('blanks bare slots: without lengthening the header', async () => {
+        const src = 'class Foo {\nslots:\n    void update() {}\n};\n';
         const result = blankQtMacros(src);
-        expect(result).toContain('public:');
+        expect(result).toBe(src.replace('slots:', '      '));
+        expect(result.length).toBe(src.length);
+        const { getParser } = await import('../src/extraction/grammars');
+        await loadGrammarsForLanguages(['cpp']);
+        const tree = getParser('cpp')!.parse(result)!;
+        try {
+            expect(tree.rootNode.hasError).toBe(false);
+            const method = tree.rootNode.descendantsOfType('function_definition')[0]!;
+            expect(method.startIndex).toBe(src.indexOf('void update'));
+            expect(method.startPosition).toEqual({ row: 2, column: 4 });
+        } finally {
+            tree.delete();
+        }
+    });
+
+    it.each(['public', 'private', 'protected'])('preserves %s slots and Q_SLOTS header coordinates', (access) => {
+        for (const alias of ['slots', 'Q_SLOTS']) {
+            const src = `class Foo {\r\n${access} ${alias}:\r\n    void update();\r\n};\r\n`;
+        const result = blankQtMacros(src);
+            expect(result).toBe(src.replace(alias, ' '.repeat(alias.length)));
+            expect(result.length).toBe(src.length);
+            expect(Buffer.byteLength(result)).toBe(Buffer.byteLength(src));
+        }
+    });
+
+    it.each(['Q_NAMESPACE', 'Q_REQUIRED_RESULT', 'Q_DECL_OVERRIDE', 'Q_DECL_FINAL', 'Q_DECL_NOEXCEPT', 'Q_DECL_DEPRECATED', 'Q_DECL_DEPRECATED_X', 'Q_DECL_UNUSED', 'Q_DECL_PURE_VIRTUAL'])('recognizes %s without another Qt token', (macro) => {
+        expect(blankQtMacros(`${macro}\n`)).toBe(`${' '.repeat(macro.length)}\n`);
+    });
+
+    it('leaves Qt macro text in ordinary literals and comments unchanged', () => {
+        const src = [
+            'const auto text = u8"Q_OBJECT QML_NAMED_ELEMENT(Foo) emit changed() \\" Q_GADGET";',
+            "const auto quote = L'\\\'';",
+            '// Q_NAMESPACE QML_UNCREATABLE("reason")',
+            '/*\nQ_OBJECT\nsignals:\npublic slots:\nQML_ELEMENT\n*/',
+        ].join('\r\n');
+        expect(blankQtMacros(src)).toBe(src);
+    });
+
+    it.each(['R', 'LR', 'u8R', 'uR', 'UR'])('leaves %s raw literal macro text unchanged', (prefix) => {
+        const literal = `${prefix}"TAG(\r\nQ_OBJECT\r\nslots:\r\nQML_UNCREATABLE(")")\r\n)TAG"`;
+        const src = `const auto text = ${literal};\r\nQ_OBJECT\r\n`;
+        expect(blankQtMacros(src)).toBe(`const auto text = ${literal};\r\n        \r\n`);
+    });
+
+    it('exports a non-code scan mask preserving UTF-16 and newline offsets', async () => {
+        const { maskCppNonCode } = await import('../src/extraction/languages/c-cpp');
+        const hidden = [
+            '// comment \\\r\nQ_OBJECT',
+            '/* \u00e9 \u{1f680}\r\nQ_NAMESPACE */',
+            'u8"escaped \\" Q_OBJECT"',
+            "L'\\\''",
+            'u8R"TAG(\r\nQML_ELEMENT\n)TAG"',
+        ].join('\n');
+        const tail = "\nconst auto number = 1'000 + 0xA'B;\nQ_OBJECT\n";
+        expect(maskCppNonCode(hidden + tail)).toBe(hidden.replace(/[^\r\n]/g, ' ') + tail);
+        expect(blankQtMacros(hidden + tail)).toBe(hidden + tail.replace('Q_OBJECT', '        '));
+    });
+
+    it('preserves non-Qt identifiers and blank lines before access headers', () => {
+        const src = 'class Foo {\n\npublic slots:\n    int Q_OBJECT_value;\n    int signalsCount;\n};\n';
+        expect(blankQtMacros(src)).toBe(src.replace('slots', '     '));
     });
 
     it('leaves ordinary signals and slots expressions unchanged', () => {
@@ -1488,4 +1873,67 @@ describe('blankQtMacros — Qt 6 QML macros', () => {
     expect(result).not.toContain('QML_VALUE_TYPE');
     expect(result.length).toBe(src.length);
   });
+
+    it.each(['\n', '\r\n'])('preserves multiline QML_NAMED_ELEMENT coordinates with %j', async (newline) => {
+        const src = ['class Counter {', '  QML_NAMED_ELEMENT(', '    Counter', '  )', 'public:', '  void refresh() {}', '};', ''].join(newline);
+        const result = blankQtMacros(src);
+        expect(result).not.toContain('QML_NAMED_ELEMENT');
+        expect(result.length).toBe(src.length);
+        expect(Buffer.byteLength(result)).toBe(Buffer.byteLength(src));
+        expect([...result.matchAll(/[\r\n]/g)].map((match) => match.index))
+            .toEqual([...src.matchAll(/[\r\n]/g)].map((match) => match.index));
+        const { cppPreParse } = await import('../src/extraction/languages/c-cpp');
+        expect(cppPreParse(src)).toBe(result);
+        const { getParser } = await import('../src/extraction/grammars');
+        await loadGrammarsForLanguages(['cpp']);
+        const tree = getParser('cpp')!.parse(result)!;
+        try {
+            expect(tree.rootNode.hasError).toBe(false);
+            const method = tree.rootNode.descendantsOfType('function_definition')[0]!;
+            expect(method.startIndex).toBe(src.indexOf('void refresh'));
+            expect(method.startPosition).toEqual({ row: 5, column: 2 });
+        } finally {
+            tree.delete();
+        }
+    });
+
+    it.each([
+        'QML_UNCREATABLE(reason("text ) (", nested(1)))',
+        'QML_UNCREATABLE(R"TAG(\") unbalanced ()TAG")',
+        "QML_UNCREATABLE(reason(1'000, '\\''))",
+        'QML_UNCREATABLE(reason(/* ) */ value))',
+    ])('balances arguments in %s', (macro) => {
+        const tail = '\nvoid refresh() {}\n';
+        expect(blankQtMacros(macro + tail)).toBe(' '.repeat(macro.length) + tail);
+    });
+
+    it.each([
+        'QML_UNCREATABLE("\u00e9 \u6c49 \u{1f680}")',
+        'QML_NAMED_ELEMENT(\u6c49)',
+        'QML_NAMED_ELEMENT(\u6c49\r\n)',
+    ])('preserves Unicode argument bytes and following method coordinates in %s', async (macro) => {
+        const src = `class Counter {\r\n  ${macro}\r\npublic:\r\n  void refresh() {}\r\n};\r\n`;
+        const result = blankQtMacros(src);
+        if (macro.startsWith('QML_UNCREATABLE')) expect(result).not.toContain('QML_');
+        else expect(result).toBe(src);
+        expect(result).toContain('\u6c49');
+        expect(result.length).toBe(src.length);
+        expect(Buffer.byteLength(result)).toBe(Buffer.byteLength(src));
+        const start = src.indexOf('void refresh');
+        expect(Buffer.byteLength(result.slice(0, start))).toBe(Buffer.byteLength(src.slice(0, start)));
+        const { cppPreParse } = await import('../src/extraction/languages/c-cpp');
+        expect(cppPreParse(src)).toBe(result);
+        expect([...result.matchAll(/[\r\n]/g)].map((match) => match.index))
+            .toEqual([...src.matchAll(/[\r\n]/g)].map((match) => match.index));
+        const { getParser } = await import('../src/extraction/grammars');
+        await loadGrammarsForLanguages(['cpp']);
+        const tree = getParser('cpp')!.parse(result)!;
+        try {
+            const method = tree.rootNode.descendantsOfType('function_definition')[0]!;
+            expect(method.startIndex).toBe(start);
+            expect(method.startPosition).toEqual({ row: 3 + (macro.includes('\n') ? 1 : 0), column: 2 });
+        } finally {
+            tree.delete();
+        }
+    });
 });

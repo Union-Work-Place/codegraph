@@ -62,6 +62,8 @@ const RE_IMPORT = /^\s*import\s+(.+?)(?:\s+as\s+(\w+))?\s*$/;
 /** Component instantiation or grouped property: TypeName { or anchors { */
 const RE_COMPONENT = /^\s*([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*)\s*\{/;
 
+const RE_BOUND_COMPONENT = /^\s*[A-Za-z_$][\w$.]*\s*:\s*([A-Z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*)\s*\{/;
+
 /** property [readonly] [required] T name [: value] */
 const RE_PROPERTY = /^\s*(?:(?:readonly|required|default|final|virtual|override)\s+)*property\s+(\S+(?:<[^>]+>)?)\s+(\w+)/;
 
@@ -100,6 +102,7 @@ const RE_CLOSE = /^\s*\}/;
 interface ComponentFrame {
   nodeId: string;
   startLine: number;
+    depth: number;
   typeName: string;
     ownerName: string;
     isGrouping?: boolean;
@@ -186,14 +189,14 @@ function consumeStructuralBraces(
     line: QmlLexicalLine,
     initialDepth: number,
     startIndex = 0,
-): { depth: number; closed: boolean } {
+): { depth: number; closed: boolean; closingIndex: number } {
     let depth = initialDepth;
     for (const brace of line.braces) {
         if (brace.index < startIndex) continue;
         depth += brace.value === '{' ? 1 : -1;
-        if (depth === 0) return { depth, closed: true };
+        if (depth === 0) return { depth, closed: true, closingIndex: brace.index };
     }
-    return { depth, closed: false };
+    return { depth, closed: false, closingIndex: -1 };
 }
 
 export class QmlExtractor {
@@ -248,6 +251,7 @@ export class QmlExtractor {
     // Stack of open component frames (one per nesting level)
     const stack: ComponentFrame[] = [];
       const qmlIdTypes = new Map<string, Set<string>>();
+      const qmlIdOwners = new Map<string, Set<string>>();
       const qmlIdNodeIds = new Map<string, Set<string>>();
       const connectionsHandlers: Array<{
           nodeId: string;
@@ -259,9 +263,6 @@ export class QmlExtractor {
     // The outermost component is named after the .qml file
     const fileName = this.filePath.split(/[/\\]/).pop() ?? this.filePath;
     const componentName = fileName.replace(/\.qml$/i, '');
-
-    // Track line numbers for block-close detection
-    const braceDepth: number[] = []; // open-brace lines for each frame
 
     // Pending JS function body collector
     let jsBodyLines: string[] = [];
@@ -278,6 +279,29 @@ export class QmlExtractor {
     // Track overall brace depth (lines with excess `{` can open a component)
     let braceBalance = 0;
       const lexicalState: QmlLexicalState = { inBlockComment: false, quote: null, escaped: false };
+      const consumeComponentBraces = (lexicalLine: QmlLexicalLine, lineNum: number, startIndex = 0): void => {
+          for (const brace of lexicalLine.braces) {
+              if (brace.index < startIndex) continue;
+              if (brace.value === '{') {
+                  braceBalance++;
+              } else if (braceBalance > 0) {
+                  const frame = stack[stack.length - 1];
+                  if (frame?.depth === braceBalance) {
+                      stack.pop();
+                      const node = !frame.isGrouping && this.nodes.find((candidate) => candidate.id === frame.nodeId);
+                      if (node) node.endLine = lineNum;
+                  }
+                  braceBalance--;
+              }
+          }
+      };
+      const closeJsBody = (nodeId: string, lineNum: number, closingIndex: number): void => {
+          const node = this.nodes.find((candidate) => candidate.id === nodeId);
+          if (node && node.kind !== 'component') {
+              node.endLine = lineNum;
+              node.endColumn = closingIndex + 1;
+          }
+      };
 
     for (let i = 0; i < lines.length; i++) {
       const rawLine = lines[i] ?? '';
@@ -288,9 +312,12 @@ export class QmlExtractor {
       // ------------------------------------------------------------------
       // If we are inside a JS function body, collect lines until depth=0
       // ------------------------------------------------------------------
-      if (jsFunctionNodeId !== null) {
-        jsBodyLines.push(rawLine);
+        if (jsFunctionNodeId !== null) {
           const bodyBalance = consumeStructuralBraces(lexicalLine, jsBodyDepth);
+          const nextBrace = bodyBalance.closed
+              ? lexicalLine.braces.find((brace) => brace.index > bodyBalance.closingIndex)?.index
+              : undefined;
+          jsBodyLines.push(rawLine.slice(0, nextBrace));
           jsBodyDepth = bodyBalance.depth;
           if (bodyBalance.closed) {
               // End of function body — delegate to JS extractor
@@ -300,6 +327,8 @@ export class QmlExtractor {
                   jsFunctionNodeId,
                   jsFunctionParentId ?? (stack[stack.length - 1]?.nodeId ?? ''),
               );
+              closeJsBody(jsFunctionNodeId, lineNum, bodyBalance.closingIndex);
+              consumeComponentBraces(lexicalLine, lineNum, bodyBalance.closingIndex + 1);
               jsFunctionNodeId = null;
               jsFunctionParentId = null;
               jsBodyLines = [];
@@ -355,23 +384,15 @@ export class QmlExtractor {
           filePath: this.filePath,
           language: 'qml',
         });
-          stack.push({ nodeId, startLine: lineNum, typeName: inlineName!, ownerName: inlineName! });
-        braceBalance++;
-        braceDepth.push(lineNum);
-          const inlineBrace = findStructuralBrace(lexicalLine, '{');
-          if (inlineBrace >= 0 && consumeStructuralBraces(lexicalLine, 0, inlineBrace).closed) {
-              stack.pop();
-              braceBalance--;
-              braceDepth.pop();
-              node.endLine = lineNum;
-          }
+          stack.push({ nodeId, startLine: lineNum, depth: braceBalance + 1, typeName: inlineName!, ownerName: inlineName! });
+          consumeComponentBraces(lexicalLine, lineNum);
         continue;
       }
 
       // ------------------------------------------------------------------
       // Track opening braces — detect component instantiations
       // ------------------------------------------------------------------
-      const componentMatch = line.match(RE_COMPONENT);
+        const componentMatch = line.match(RE_COMPONENT) ?? line.match(RE_BOUND_COMPONENT);
       if (componentMatch) {
         const typeName = componentMatch[1]!;
         const parentFrame = stack[stack.length - 1];
@@ -394,7 +415,7 @@ export class QmlExtractor {
             updatedAt: Date.now(),
           };
           this.nodes.push(node);
-            stack.push({ nodeId, startLine: lineNum, typeName, ownerName: componentName });
+            stack.push({ nodeId, startLine: lineNum, depth: braceBalance + 1, typeName, ownerName: componentName });
 
           // Emit an `extends` edge: this component extends its root type
           // (unless it's a QtObject or unknown built-in without user interest)
@@ -450,11 +471,12 @@ export class QmlExtractor {
               });
             }
 
-              stack.push({ nodeId, startLine: lineNum, typeName, ownerName: typeName });
+              stack.push({ nodeId, startLine: lineNum, depth: braceBalance + 1, typeName, ownerName: typeName });
           } else {
               stack.push({
                   nodeId: parentFrame.nodeId,
                   startLine: lineNum,
+                  depth: braceBalance + 1,
                   typeName: '',
                   ownerName: parentFrame.ownerName,
                   isGrouping: true,
@@ -462,16 +484,7 @@ export class QmlExtractor {
           }
         }
 
-        braceBalance++;
-        braceDepth.push(lineNum);
-          const componentBrace = findStructuralBrace(lexicalLine, '{');
-          if (componentBrace >= 0 && consumeStructuralBraces(lexicalLine, 0, componentBrace).closed) {
-              const frame = stack.pop();
-              braceBalance--;
-              braceDepth.pop();
-              const node = frame && !frame.isGrouping && this.nodes.find((candidate) => candidate.id === frame.nodeId);
-              if (node) node.endLine = lineNum;
-          }
+          consumeComponentBraces(lexicalLine, lineNum);
         continue;
       }
 
@@ -502,8 +515,7 @@ export class QmlExtractor {
           if (currentFrame) {
             this.edges.push({ source: currentFrame.nodeId, target: nodeId, kind: 'contains' });
           }
-          enumDepth = 1;
-          braceBalance++;
+            enumDepth = 1;
 
           // Process the rest of the opening line — may contain members and close
             const enumBrace = findStructuralBrace(lexicalLine, '{');
@@ -516,7 +528,7 @@ export class QmlExtractor {
                 enumNode.endLine = lineNum;
                 enumNodeId = null;
                 enumDepth = 0;
-                braceBalance--;
+                consumeComponentBraces(lexicalLine, lineNum, enumBalance.closingIndex + 1);
           }
           continue;
         }
@@ -528,7 +540,7 @@ export class QmlExtractor {
               const enumNode = this.nodes.find((n) => n.id === enumNodeId);
               if (enumNode) enumNode.endLine = lineNum;
               enumNodeId = null;
-              braceBalance--;
+              consumeComponentBraces(lexicalLine, lineNum, enumBalance.closingIndex + 1);
         }
         // Extract member identifier from lines inside the enum body
           if (!enumBalance.closed && enumDepth > 0 && enumNodeId) {
@@ -541,20 +553,7 @@ export class QmlExtractor {
       // Closing brace — pop component stack
       // ------------------------------------------------------------------
       if (RE_CLOSE.test(line) && braceBalance > 0) {
-        braceBalance--;
-        braceDepth.pop();
-
-        if (stack.length > 0) {
-          const frame = stack[stack.length - 1]!;
-          // Patch the endLine of the corresponding node
-            const node = frame.isGrouping ? undefined : this.nodes.find((n) => n.id === frame.nodeId);
-          if (node && node.endLine === (node.startLine)) {
-            node.endLine = lineNum;
-          } else if (node && node.endLine > node.startLine) {
-            // root component — leave it, already covers file
-          }
-          stack.pop();
-        }
+          consumeComponentBraces(lexicalLine, lineNum);
         continue;
       }
 
@@ -571,6 +570,9 @@ export class QmlExtractor {
           const types = qmlIdTypes.get(idMatch[1]!) ?? new Set<string>();
           types.add(currentFrame.typeName);
           qmlIdTypes.set(idMatch[1]!, types);
+          const owners = qmlIdOwners.get(idMatch[1]!) ?? new Set<string>();
+          owners.add(currentFrame.ownerName);
+          qmlIdOwners.set(idMatch[1]!, owners);
           const nodeIds = qmlIdNodeIds.get(idMatch[1]!) ?? new Set<string>();
           nodeIds.add(currentFrame.nodeId);
           qmlIdNodeIds.set(idMatch[1]!, nodeIds);
@@ -612,7 +614,23 @@ export class QmlExtractor {
         this.edges.push({ source: currentFrame.nodeId, target: nodeId, kind: 'contains' });
           const initializerColumn = line.indexOf(':', propMatch[0].length);
           if (initializerColumn >= 0) {
-              this.extractJsBody(line.slice(initializerColumn + 1), lineNum, nodeId, currentFrame.nodeId);
+              const bodyBalance = consumeStructuralBraces(lexicalLine, 0, initializerColumn + 1);
+              const nextBrace = bodyBalance.closed
+                  ? lexicalLine.braces.find((brace) => brace.index > bodyBalance.closingIndex)?.index
+                  : undefined;
+              const initializer = rawLine.slice(initializerColumn + 1, nextBrace);
+              if (bodyBalance.depth > 0) {
+                  jsFunctionNodeId = nodeId;
+                  jsFunctionParentId = currentFrame.nodeId;
+                  jsBodyStartLine = lineNum;
+                  jsBodyLines = [initializer];
+                  jsBodyDepth = bodyBalance.depth;
+              } else {
+                  this.extractJsBody(initializer, lineNum, nodeId, currentFrame.nodeId);
+                  if (bodyBalance.closed) {
+                      consumeComponentBraces(lexicalLine, lineNum, bodyBalance.closingIndex + 1);
+                  }
+              }
           }
         continue;
       }
@@ -691,7 +709,9 @@ export class QmlExtractor {
             const bodyBalance = consumeStructuralBraces(lexicalLine, 0, braceInLine);
             jsBodyDepth = bodyBalance.depth;
             if (bodyBalance.closed) {
-                this.extractJsBody(jsBodyLines.join('\n'), jsBodyStartLine, nodeId, currentFrame.nodeId);
+                this.extractJsBody(rawLine.slice(braceInLine, bodyBalance.closingIndex + 1), jsBodyStartLine, nodeId, currentFrame.nodeId);
+                closeJsBody(nodeId, lineNum, bodyBalance.closingIndex);
+                consumeComponentBraces(lexicalLine, lineNum, bodyBalance.closingIndex + 1);
                 jsFunctionNodeId = null;
               jsFunctionParentId = null;
               jsBodyLines = [];
@@ -726,7 +746,10 @@ export class QmlExtractor {
 
           // Derive the signal name from the handler: onFoo → foo, onFooChanged → fooChanged
           const signalName = handlerName[2]!.toLowerCase() + handlerName.slice(3);
-          this.unresolvedRefs.push({
+              if (currentFrame.typeName === 'Connections') {
+                  connectionsHandlers.push({ nodeId: handlerNodeId, handlerName, line: lineNum, frame: currentFrame });
+              } else {
+                this.unresolvedRefs.push({
               fromNodeId: handlerNodeId,
             referenceName: signalName,
               referenceKind: 'references',
@@ -735,7 +758,8 @@ export class QmlExtractor {
             filePath: this.filePath,
             language: 'qml',
               candidates: [`${currentFrame.ownerName}::${signalName}`],
-          });
+              });
+            }
         }
           // Handle block and arrow-function handler bodies as embedded JS.
           const braceInLine = findStructuralBrace(lexicalLine, '{', handlerMatch.index ?? 0);
@@ -747,7 +771,9 @@ export class QmlExtractor {
               const bodyBalance = consumeStructuralBraces(lexicalLine, 0, braceInLine);
               jsBodyDepth = bodyBalance.depth;
               if (bodyBalance.closed) {
-                  this.extractJsBody(jsBodyLines.join('\n'), jsBodyStartLine, handlerNodeId, currentFrame.nodeId);
+                  this.extractJsBody(rawLine.slice(braceInLine, bodyBalance.closingIndex + 1), jsBodyStartLine, handlerNodeId, currentFrame.nodeId);
+                  closeJsBody(handlerNodeId, lineNum, bodyBalance.closingIndex);
+                  consumeComponentBraces(lexicalLine, lineNum, bodyBalance.closingIndex + 1);
                   jsFunctionNodeId = null;
               jsFunctionParentId = null;
               jsBodyLines = [];
@@ -819,7 +845,9 @@ export class QmlExtractor {
               const bodyBalance = consumeStructuralBraces(lexicalLine, 0, braceInLine);
               jsBodyDepth = bodyBalance.depth;
               if (bodyBalance.closed) {
-                  this.extractJsBody(jsBodyLines.join('\n'), jsBodyStartLine, nodeId, currentFrame.nodeId);
+                  this.extractJsBody(rawLine.slice(braceInLine, bodyBalance.closingIndex + 1), jsBodyStartLine, nodeId, currentFrame.nodeId);
+                  closeJsBody(nodeId, lineNum, bodyBalance.closingIndex);
+                  consumeComponentBraces(lexicalLine, lineNum, bodyBalance.closingIndex + 1);
                   jsFunctionNodeId = null;
                   jsFunctionParentId = null;
                   jsBodyLines = [];
@@ -837,26 +865,31 @@ export class QmlExtractor {
       // Any remaining lines with a { that we haven't matched as a component
       // still increment the brace balance so the stack stays correct.
       // ------------------------------------------------------------------
-        for (const brace of lexicalLine.braces) {
-            if (brace.value === '{') { braceBalance++; braceDepth.push(lineNum); }
-            else if (brace.value === '}' && braceBalance > 0) {
-          braceBalance--;
-          braceDepth.pop();
-          if (stack.length > 0) {
-            const frame = stack[stack.length - 1]!;
-            const node = this.nodes.find((n) => n.id === frame.nodeId);
-            if (node && node.endLine < lineNum) node.endLine = lineNum;
-            // Only pop real component frames, not anonymous binding braces
-            // We already handled } on its own line above. Skip here to avoid double-pop.
+        const bindingMatch = line.match(/^\s*[A-Za-z_$][\w$.]*\s*:/);
+        if (bindingMatch && findStructuralBrace(lexicalLine, '{', bindingMatch[0].length) >= 0) {
+            const bodyBalance = consumeStructuralBraces(lexicalLine, 0, bindingMatch[0].length);
+            const nextBrace = bodyBalance.closed
+                ? lexicalLine.braces.find((brace) => brace.index > bodyBalance.closingIndex)?.index
+                : undefined;
+            const body = rawLine.slice(bindingMatch[0].length, nextBrace);
+            if (bodyBalance.depth > 0) {
+                jsFunctionNodeId = currentFrame.nodeId;
+                jsFunctionParentId = currentFrame.nodeId;
+                jsBodyStartLine = lineNum;
+                jsBodyLines = [body];
+                jsBodyDepth = bodyBalance.depth;
+            } else {
+                this.extractJsBody(body, lineNum, currentFrame.nodeId, currentFrame.nodeId);
+                consumeComponentBraces(lexicalLine, lineNum, bodyBalance.closingIndex + 1);
           }
-          break; // one } per line in this fallback
-        }
+          continue;
       }
+        consumeComponentBraces(lexicalLine, lineNum);
     }
 
-      this.linkConnectionsSignalHandlers(connectionsHandlers, qmlIdTypes, qmlIdNodeIds);
+      this.linkConnectionsSignalHandlers(connectionsHandlers, qmlIdOwners, qmlIdNodeIds);
       this.linkLocalComponentFactories(qmlIdTypes, qmlIdNodeIds);
-      this.annotateQmlMemberReferences(qmlIdTypes);
+      this.annotateQmlMemberReferences(qmlIdOwners, qmlIdNodeIds);
       this.linkLocalEnumAccesses();
 
     // Patch root component endLine to cover the whole file
@@ -945,16 +978,23 @@ export class QmlExtractor {
 
     private linkConnectionsSignalHandlers(
         handlers: Array<{ nodeId: string; handlerName: string; line: number; frame: ComponentFrame }>,
-        qmlIdTypes: Map<string, Set<string>>,
+        qmlIdOwners: Map<string, Set<string>>,
         qmlIdNodeIds: Map<string, Set<string>>,
     ): void {
         for (const handler of handlers) {
             const targetId = handler.frame.connectionsTarget;
-            const types = targetId ? qmlIdTypes.get(targetId) : undefined;
-            const nodeIds = targetId ? qmlIdNodeIds.get(targetId) : undefined;
-            if (types?.size !== 1 || nodeIds?.size !== 1) continue;
-
+            if (!targetId) continue;
+            const owners = qmlIdOwners.get(targetId);
+            const nodeIds = qmlIdNodeIds.get(targetId);
             const signalName = handler.handlerName[2]!.toLowerCase() + handler.handlerName.slice(3);
+            let candidate: string;
+            if (owners) {
+                if (owners.size !== 1 || nodeIds?.size !== 1) continue;
+                candidate = `${[...owners][0]!}::${signalName}`;
+            } else {
+                if (this.qmlShadowNames.has(targetId)) continue;
+                candidate = `qt.context-signal|${targetId}|${signalName}`;
+            }
             this.unresolvedRefs.push({
                 fromNodeId: handler.nodeId,
                 referenceName: signalName,
@@ -963,27 +1003,30 @@ export class QmlExtractor {
                 column: 0,
                 filePath: this.filePath,
                 language: 'qml',
-                candidates: [`${[...types][0]!}::${signalName}`],
+                candidates: [candidate],
             });
         }
     }
 
-    private annotateQmlMemberReferences(qmlIdTypes: Map<string, Set<string>>): void {
+    private annotateQmlMemberReferences(
+        qmlIdOwners: Map<string, Set<string>>,
+        qmlIdNodeIds: Map<string, Set<string>>,
+    ): void {
         for (const ref of this.unresolvedRefs) {
             if (ref.referenceKind !== 'calls') continue;
             const memberCall = ref.referenceName.match(/^([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)$/);
             if (!memberCall) continue;
             const [, receiver, methodName] = memberCall;
-            const types = qmlIdTypes.get(receiver!);
+            if (this.jsLocalNames.get(ref.fromNodeId)?.has(receiver!)) continue;
+            const owners = qmlIdOwners.get(receiver!);
             let candidate: string;
-            if (types?.size === 1) {
-                const typeName = [...types][0]!;
-                candidate = `qt.qml-id|${receiver}|${typeName}|${methodName}`;
+            if (owners?.size === 1 && qmlIdNodeIds.get(receiver!)?.size === 1) {
+                const ownerName = [...owners][0]!;
+                candidate = `qt.qml-id|${receiver}|${ownerName}|${methodName}`;
             } else {
                 if (
-                    types ||
-                    this.qmlShadowNames.has(receiver!) ||
-                    this.jsLocalNames.get(ref.fromNodeId)?.has(receiver!)
+                    owners ||
+                    this.qmlShadowNames.has(receiver!)
                 ) continue;
                 candidate = `qt.context-property|${receiver}|${methodName}`;
             }
@@ -1098,6 +1141,10 @@ export class QmlExtractor {
         const localNames = this.jsLocalNames.get(functionNodeId) ?? new Set<string>();
         for (const node of result.nodes) {
             if (node.kind === 'variable' || node.kind === 'parameter') localNames.add(node.name);
+        }
+        for (const declaration of tree?.rootNode.descendantsOfType('variable_declarator') ?? []) {
+            const name = getChildByField(declaration, 'name');
+            if (name?.type === 'identifier') localNames.add(name.text);
         }
         this.jsLocalNames.set(functionNodeId, localNames);
 

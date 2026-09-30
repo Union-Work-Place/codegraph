@@ -22,6 +22,7 @@
 import * as path from 'path';
 import { Node, Language } from '../../types';
 import { generateNodeId } from '../../extraction/tree-sitter-helpers';
+import { maskCppNonCode } from '../../extraction/languages/c-cpp';
 import {
   FrameworkResolver,
   FrameworkExtractionResult,
@@ -79,7 +80,7 @@ const RE_Q_PROPERTY = /Q_PROPERTY\s*\(\s*([^)]+)\)/g;
  *   connect(sender, &ClassName::methodName, receiver, &ClassName::methodName)
  */
 const RE_CONNECT_MACRO = /connect\s*\(\s*\w[^,]*,\s*SIGNAL\s*\(\s*(\w+)\s*\([^)]*\)\s*\)\s*,\s*\w[^,]*,\s*SLOT\s*\(\s*(\w+)\s*\([^)]*\)\s*\)/g;
-const RE_CONNECT_PTR = /connect\s*\(\s*\w[^,]*,\s*&\s*(\w+)\s*::\s*(\w+)\s*,\s*\w[^,]*,\s*&\s*(\w+)\s*::\s*(\w+)/g;
+const RE_CONNECT_PTR = /connect\s*\(\s*\w[^,]*,\s*&\s*((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)\s*::\s*(\w+)\s*,\s*\w[^,]*,\s*&\s*((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)\s*::\s*(\w+)/g;
 
 /**
  * QML_NAMED_ELEMENT(QmlTypeName) — registers the C++ class under a custom QML name.
@@ -93,26 +94,94 @@ const RE_QML_NAMED_ELEMENT = /\bQML_NAMED_ELEMENT\s*\(\s*(\w+)\s*\)/g;
  */
 const QML_ELEMENT_PATTERN = /\bQML_ELEMENT\b/;
 
+function hasQtCppMarkers(content: string, code: string): boolean {
+    if (Q_OBJECT_PATTERN.test(code) || QML_ELEMENT_PATTERN.test(code)) return true;
+    for (const match of content.matchAll(new RegExp(QT_INCLUDE_PATTERN.source, 'gm'))) {
+        if (code.slice(match.index, match.index + '#include'.length) === '#include') return true;
+    }
+    return false;
+}
+
 /**
  * qmlRegister{,Singleton,Uncreatable}Type<CppClass>("uri", major, minor, "QmlName")
  * Captures the registration API, namespaced C++ type, and QML element name.
  */
 const RE_QML_REGISTER_TYPE = /\b(qmlRegister(?:Singleton|Uncreatable)?Type)\s*<\s*((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)\s*>\s*\(\s*"[^"]*"\s*,\s*\d+\s*,\s*\d+\s*,\s*"([A-Za-z_]\w*)"/g;
 
-/** A literal context name and bare pointer variable passed to setContextProperty. */
-const RE_SET_CONTEXT_PROPERTY = /\b((?:(?:[A-Za-z_]\w*)\s*(?:\.|->)\s*)?rootContext\s*\(\s*\)|([A-Za-z_]\w*))\s*->\s*setContextProperty\s*\(\s*"([A-Za-z_$][\w$]*)"\s*,\s*([A-Za-z_]\w*)\s*\)/g;
+/** A literal context name and pointer, optionally wrapped by QVariant::fromValue. */
+const RE_SET_CONTEXT_PROPERTY = /\b((?:(?:[A-Za-z_]\w*)\s*(?:\.|->)\s*)?rootContext\s*\(\s*\)|([A-Za-z_]\w*))\s*->\s*setContextProperty\s*\(\s*"([A-Za-z_$][\w$]*)"\s*,\s*(?:([A-Za-z_]\w*)|QVariant\s*::\s*fromValue\s*\(\s*([A-Za-z_]\w*)\s*\))\s*\)/g;
 
 /**
  * Q_INVOKABLE method declaration outside of signals:/slots: sections.
  * Captures the return type and method name for tagging as invokable.
  */
-const RE_Q_INVOKABLE_DECL = /^\s*Q_INVOKABLE\s+(?:(?:virtual|inline|static|explicit|const)\s+)*(\S[\s\S]*?)\s+(\w+)\s*\(([^)]*)\)\s*(?:const\s*)?(?:override\s*)?(?:final\s*)?(?:noexcept\s*)?;/;
+const RE_Q_INVOKABLE_DECL = /^\s*Q_INVOKABLE\s+(?:(?:virtual|inline|static|explicit|const)\s+)*(\S[^();{}]*?)\s+(\w+)\s*\(/;
+
+function qtClosingParenthesis(source: string, opening: number): number | null {
+    if (opening < 0 || source[opening] !== '(') return null;
+    let depth = 0;
+    for (let index = opening; index < source.length; index++) {
+        if (source[index] === '(') depth++;
+        else if (source[index] === ')' && --depth === 0) return index;
+    }
+    return null;
+}
 
 /**
  * Matches a class or struct that contains Q_OBJECT/Q_GADGET.
  * Used to associate extracted members with a parent class.
  */
-const RE_CLASS_HEADER = /^\s*(?:class|struct)\s+(?:[A-Z][A-Z0-9_]+\s+)?(\w+)\s*(?:final\s*)?(?::\s*[^{]+)?\{/;
+interface QtCppScope {
+    offset: number;
+    namespaceName: string;
+    className: string | null;
+}
+
+function getQtCppScopes(source: string): QtCppScope[] {
+    const scopes: QtCppScope[] = [{ offset: 0, namespaceName: '', className: null }];
+    const stack: Array<{ namespaceName: string; className: string | null }> = [];
+    const tokens = /\b(?:inline\s+)?namespace\s+((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)\s*\{|\b(?:class|struct)\s+(?:[A-Z][A-Z0-9_]+\s+)?([A-Za-z_]\w*)\s*(?:final\s*)?(?::\s*[^;{}]+)?\{|[{}]/g;
+    let namespaceName = '';
+    let className: string | null = null;
+    let match: RegExpExecArray | null;
+    while ((match = tokens.exec(source)) !== null) {
+        if (match[0] === '}') {
+            const parent = stack.pop();
+            namespaceName = parent?.namespaceName ?? '';
+            className = parent?.className ?? null;
+        } else {
+            stack.push({ namespaceName, className });
+            if (match[1]) {
+                namespaceName = [namespaceName, match[1].replace(/\s*::\s*/g, '::')].filter(Boolean).join('::');
+            } else if (match[2]) {
+                className = [className ?? namespaceName, match[2]].filter(Boolean).join('::');
+            }
+        }
+        scopes.push({ offset: match.index + match[0].length, namespaceName, className });
+    }
+    return scopes;
+}
+
+function qtScopeAt(scopes: QtCppScope[], offset: number): QtCppScope {
+    let lower = 0;
+    let upper = scopes.length;
+    while (lower + 1 < upper) {
+        const middle = Math.floor((lower + upper) / 2);
+        if (scopes[middle]!.offset <= offset) lower = middle;
+        else upper = middle;
+    }
+    return scopes[lower]!;
+}
+
+function qualifyQtType(type: string, namespaceName: string): string {
+    const normalized = type.replace(/\s*::\s*/g, '::');
+    return namespaceName && !normalized.includes('::') ? `${namespaceName}::${normalized}` : normalized;
+}
+
+function qtCodeOpener(source: string, match: RegExpExecArray): boolean {
+    const token = match[0].match(/^[A-Za-z_]\w*/)?.[0];
+    return !!token && source.slice(match.index, match.index + token.length) === token;
+}
 
 // ---------------------------------------------------------------------------
 // Q_PROPERTY parsing
@@ -168,14 +237,17 @@ function getUniquePointerType(content: string, variableName: string): string | n
         'g',
     );
     const types = new Set<string>();
+    let declarations = 0;
     let match: RegExpExecArray | null;
     while ((match = declaration.exec(content)) !== null) {
+        declarations++;
         types.add(match[1]!.replace(/\s*::\s*/g, '::'));
     }
     while ((match = autoNewDeclaration.exec(content)) !== null) {
+        declarations++;
         types.add(match[1]!.replace(/\s*::\s*/g, '::'));
     }
-    return types.size === 1 ? [...types][0]! : null;
+    return declarations === 1 && types.size === 1 ? [...types][0]! : null;
 }
 
 function getEnclosingFunctionPrefix(content: string, offset: number): string | null {
@@ -210,44 +282,27 @@ function extractQtFromCpp(
 ): FrameworkExtractionResult {
   const nodes: Node[] = [];
   const references: UnresolvedRef[] = [];
+    const code = maskCppNonCode(content);
 
   // Quick bail-out: not a Qt file
-  if (!Q_OBJECT_PATTERN.test(content) && !QT_INCLUDE_PATTERN.test(content)) {
+    if (!hasQtCppMarkers(content, code)) {
     return { nodes, references };
   }
 
-  const lines = content.split('\n');
-  let currentClass: string | null = null;
-    const classAtLine = new Map<number, string>();
+    const lines = code.split('\n');
+    const scopes = getQtCppScopes(code);
   let currentSection: 'signals' | 'slots' | null = null;
-  let braceDepth = 0;
-  let classBraceDepth = -1;
+    let previousClass: string | null = null;
+    let lineOffset = 0;
 
   // ---- pass 1: class + section + member extraction ----
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     const lineNum = i + 1;
-
-    // Track brace depth
-    for (const ch of line) {
-      if (ch === '{') braceDepth++;
-      else if (ch === '}') {
-        braceDepth--;
-        if (braceDepth === classBraceDepth) {
-          currentClass = null;
-          classBraceDepth = -1;
-          currentSection = null;
-        }
-      }
-    }
-
-    // Detect class header
-    const classMatch = line.match(RE_CLASS_HEADER);
-    if (classMatch && currentClass === null) {
-      currentClass = classMatch[1]!;
-      classBraceDepth = braceDepth - 1; // depth at open brace
-    }
-      if (currentClass) classAtLine.set(lineNum, currentClass);
+      const currentClass = qtScopeAt(scopes, lineOffset + Math.max(0, line.search(/\S/))).className;
+      lineOffset += line.length + 1;
+      if (currentClass !== previousClass) currentSection = null;
+      previousClass = currentClass;
 
     // Detect section change
     if (RE_SECTION.test(line)) {
@@ -297,9 +352,16 @@ function extractQtFromCpp(
         }
         const declaration = declarationLines.join('\n');
         const invokableMatch = declaration.match(RE_Q_INVOKABLE_DECL);
-      if (invokableMatch) {
+        const opening = invokableMatch ? invokableMatch[0].length - 1 : -1;
+        const closing = qtClosingParenthesis(declaration, opening);
+        const suffix = closing === null ? null : declaration.slice(closing + 1).match(
+            /^\s*(?:const\s*)?(?:override\s*)?(?:final\s*)?(?:noexcept\s*)?;/,
+        );
+        if (invokableMatch && closing !== null && suffix) {
         const methodName = invokableMatch[2]!;
-          const params = (invokableMatch[3] ?? '').replace(/\s+/g, ' ').trim();
+          const declarationOffset = lineOffset - line.length - 1;
+          const params = content.slice(declarationOffset + opening + 1, declarationOffset + closing).replace(/\s+/g, ' ').trim();
+          const matchedLines = declaration.slice(0, closing + 1 + suffix[0].length).split('\n');
         const nodeId = generateNodeId(filePath, 'method', `${currentClass}::${methodName}`, lineNum);
         nodes.push({
           id: nodeId,
@@ -309,9 +371,9 @@ function extractQtFromCpp(
           filePath,
           language: 'cpp' as Language,
           startLine: lineNum,
-            endLine: lineNum + declarationLines.length - 1,
+            endLine: lineNum + matchedLines.length - 1,
           startColumn: line.search(/\S/),
-            endColumn: declarationLines.at(-1)!.trimEnd().length,
+            endColumn: matchedLines.at(-1)!.length,
           signature: `invokable ${methodName}(${params})`,
           updatedAt: Date.now(),
         });
@@ -323,19 +385,21 @@ function extractQtFromCpp(
   // Re-scan with regex over the full source (may span lines but usually one line)
   let propMatch: RegExpExecArray | null;
   RE_Q_PROPERTY.lastIndex = 0;
-  while ((propMatch = RE_Q_PROPERTY.exec(content)) !== null) {
+    while ((propMatch = RE_Q_PROPERTY.exec(code)) !== null) {
     const macroBody = propMatch[1]!;
     const prop = parseQProperty(macroBody);
     if (!prop || !prop.name) continue;
 
     // Determine line number from the match offset
     const lineNum = content.slice(0, propMatch.index).split('\n').length;
-    const nodeId = generateNodeId(filePath, 'property', prop.name, lineNum);
+      const ownerName = qtScopeAt(scopes, propMatch.index).className;
+      const memberName = ownerName ? `${ownerName}::${prop.name}` : prop.name;
+      const nodeId = generateNodeId(filePath, 'property', memberName, lineNum);
     nodes.push({
       id: nodeId,
       kind: 'property',
       name: prop.name,
-      qualifiedName: `${filePath}::${prop.name}`,
+        qualifiedName: `${filePath}::${memberName}`,
       filePath,
       language: 'cpp' as Language,
       startLine: lineNum,
@@ -369,7 +433,7 @@ function extractQtFromCpp(
   // ---- pass 3: connect() call extraction ----
   RE_CONNECT_MACRO.lastIndex = 0;
   let connectMatch: RegExpExecArray | null;
-  while ((connectMatch = RE_CONNECT_MACRO.exec(content)) !== null) {
+    while ((connectMatch = RE_CONNECT_MACRO.exec(code)) !== null) {
     const signalName = connectMatch[1]!;
     const slotName = connectMatch[2]!;
     const lineNum = content.slice(0, connectMatch.index).split('\n').length;
@@ -395,11 +459,11 @@ function extractQtFromCpp(
   }
 
   RE_CONNECT_PTR.lastIndex = 0;
-  while ((connectMatch = RE_CONNECT_PTR.exec(content)) !== null) {
+    while ((connectMatch = RE_CONNECT_PTR.exec(code)) !== null) {
     // &ClassName::signalName
-    const signalClass = connectMatch[1]!;
+      const signalClass = qualifyQtType(connectMatch[1]!, qtScopeAt(scopes, connectMatch.index).namespaceName);
     const signalName = connectMatch[2]!;
-    const slotClass = connectMatch[3]!;
+      const slotClass = qualifyQtType(connectMatch[3]!, qtScopeAt(scopes, connectMatch.index).namespaceName);
     const slotName = connectMatch[4]!;
     const lineNum = content.slice(0, connectMatch.index).split('\n').length;
 
@@ -431,10 +495,10 @@ function extractQtFromCpp(
   // Creates a `component` alias node so QML `TypeName { }` can resolve to the C++ class.
   RE_QML_NAMED_ELEMENT.lastIndex = 0;
   let qmlNamedMatch: RegExpExecArray | null;
-  while ((qmlNamedMatch = RE_QML_NAMED_ELEMENT.exec(content)) !== null) {
+    while ((qmlNamedMatch = RE_QML_NAMED_ELEMENT.exec(code)) !== null) {
     const qmlName = qmlNamedMatch[1]!;
     const lineNum = content.slice(0, qmlNamedMatch.index).split('\n').length;
-      const cppClass = classAtLine.get(lineNum);
+      const cppClass = qtScopeAt(scopes, qmlNamedMatch.index).className;
       if (!cppClass) continue;
     const nodeId = generateNodeId(filePath, 'component', qmlName, lineNum);
     nodes.push({
@@ -468,8 +532,9 @@ function extractQtFromCpp(
   RE_QML_REGISTER_TYPE.lastIndex = 0;
   let qmlRegMatch: RegExpExecArray | null;
   while ((qmlRegMatch = RE_QML_REGISTER_TYPE.exec(content)) !== null) {
+      if (!qtCodeOpener(code, qmlRegMatch)) continue;
       const registration = qmlRegMatch[1]!;
-      const cppClass = qmlRegMatch[2]!.replace(/\s*::\s*/g, '::');
+      const cppClass = qualifyQtType(qmlRegMatch[2]!, qtScopeAt(scopes, qmlRegMatch.index).namespaceName);
       const qmlName = qmlRegMatch[3]!;
       const lineNum = content.slice(0, qmlRegMatch.index).split('\n').length;
       const nodeId = generateNodeId(filePath, 'component', qmlName, lineNum);
@@ -503,16 +568,18 @@ function extractQtFromCpp(
     RE_SET_CONTEXT_PROPERTY.lastIndex = 0;
     let contextPropertyMatch: RegExpExecArray | null;
     while ((contextPropertyMatch = RE_SET_CONTEXT_PROPERTY.exec(content)) !== null) {
+        if (!qtCodeOpener(code, contextPropertyMatch)) continue;
         const receiverExpression = contextPropertyMatch[1]!;
         const receiverName = contextPropertyMatch[2];
         const contextName = contextPropertyMatch[3]!;
-        const valueName = contextPropertyMatch[4]!;
-        const functionPrefix = getEnclosingFunctionPrefix(content, contextPropertyMatch.index);
+        const valueName = (contextPropertyMatch[4] ?? contextPropertyMatch[5])!;
+        const functionPrefix = getEnclosingFunctionPrefix(code, contextPropertyMatch.index);
         if (!functionPrefix) continue;
         if (receiverName && getUniquePointerType(functionPrefix, receiverName) !== 'QQmlContext') continue;
         if (!receiverName && !/rootContext\s*\(/.test(receiverExpression)) continue;
-        const valueType = getUniquePointerType(functionPrefix, valueName);
-        if (!valueType) continue;
+        const pointerType = getUniquePointerType(functionPrefix, valueName);
+        if (!pointerType) continue;
+        const valueType = qualifyQtType(pointerType, qtScopeAt(scopes, contextPropertyMatch.index).namespaceName);
         const lineNum = content.slice(0, contextPropertyMatch.index).split('\n').length;
         nodes.push({
             id: generateNodeId(filePath, 'variable', `qt-context-property:${contextName}`, lineNum),
@@ -536,6 +603,75 @@ function extractQtFromCpp(
 // ---------------------------------------------------------------------------
 // QML signal handler → C++ signal resolution
 // ---------------------------------------------------------------------------
+
+export function qtCanonicalName(node: Node): string {
+    const filePrefix = `${node.filePath}::`;
+    return (node.qualifiedName.startsWith(filePrefix)
+        ? node.qualifiedName.slice(filePrefix.length)
+        : node.qualifiedName).replace(/\s*::\s*/g, '::');
+}
+
+export function qtExecutableTarget(declaration: Node, context: ResolutionContext): Node {
+    if (declaration.signature?.startsWith('signal ')) return declaration;
+    const canonicalName = qtCanonicalName(declaration);
+    const implementations = context.getNodesByName(declaration.name).filter((node) => {
+        if (node.id === declaration.id || (node.kind !== 'method' && node.kind !== 'function')) return false;
+        if (node.language !== 'cpp' && node.language !== 'c') return false;
+        if (qtCanonicalName(node) !== canonicalName || /^(?:signal|slot|invokable) /.test(node.signature ?? '')) return false;
+        const content = context.readFile(node.filePath);
+        if (!content) return false;
+        const source = maskCppNonCode(content.split('\n').slice(node.startLine - 1, node.endLine).join('\n'));
+        return /\)\s*(?:const\s*|noexcept\s*|override\s*|final\s*)*\{/.test(source);
+    });
+    if (implementations.length !== 1) return declaration;
+    const parameterSignature = (node: Node): string | null => {
+        let header = node.signature ? maskCppNonCode(node.signature) : undefined;
+        if (!node.signature) {
+            const content = context.readFile(node.filePath);
+            if (!content) return null;
+            header = maskCppNonCode(content.split('\n').slice(node.startLine - 1, node.endLine).join('\n')).split('{')[0]!;
+        }
+        if (header === undefined) return null;
+        const opening = header.indexOf('(');
+        const closing = qtClosingParenthesis(header, opening);
+        const suffix = node.signature ? /^\s*;?$/ : /^\s*(?:const\s*|noexcept\s*|override\s*|final\s*)*$/;
+        if (closing === null || !suffix.test(header.slice(closing + 1))) return null;
+        const parameters = header.slice(opening + 1, closing);
+        if (!parameters.trim() || parameters.trim() === 'void') return '';
+        const parameterTypes: string[] = [];
+        let parameterType = '';
+        let depth = 0;
+        let hasDefault = false;
+        for (const character of `${parameters},`) {
+            if (character === ',' && depth === 0) {
+                parameterTypes.push(parameterType.trim());
+                parameterType = '';
+                hasDefault = false;
+                continue;
+            }
+            if (character === '=' && depth === 0) hasDefault = true;
+            if (!hasDefault) parameterType += character;
+            if ('([{'.includes(character)) depth++;
+            else if (')]}'.includes(character)) depth--;
+            if (depth < 0) return null;
+        }
+        if (depth !== 0) return null;
+        const types: string[] = [];
+        for (const parameter of parameterTypes) {
+            let type = parameter;
+            if (!/^[A-Za-z_][\w\s:*&]*$/.test(type)) return null;
+            type = type.replace(/(.*[\s*&])([A-Za-z_]\w*)$/, (whole, prefix: string, name: string) =>
+                /^(?:void|bool|char|short|int|long|float|double|signed|unsigned|const|volatile)$/.test(name)
+                    || /^(?:const|volatile|struct|class|enum)\s*$/.test(prefix) ? whole : prefix);
+            types.push(type.replace(/\s+/g, ' ').replace(/\s*([:*&])\s*/g, '$1').trim());
+        }
+        return types.join(',');
+    };
+    const declaredSignature = parameterSignature(declaration);
+    return declaredSignature !== null && declaredSignature === parameterSignature(implementations[0]!)
+        ? implementations[0]!
+        : declaration;
+}
 
 /**
  * Converts a QML signal handler name to the underlying signal name.
@@ -584,6 +720,15 @@ function getQmlContextPropertyCall(ref: UnresolvedRef): { contextName: string; m
     return null;
 }
 
+function getQmlContextSignal(ref: UnresolvedRef): { contextName: string; methodName: string } | null {
+    if (ref.language !== 'qml' || ref.referenceKind !== 'references') return null;
+    for (const candidate of ref.candidates ?? []) {
+        const match = candidate.match(/^qt\.context-signal\|([^|]+)\|([^|]+)$/);
+        if (match && match[2] === ref.referenceName) return { contextName: match[1]!, methodName: match[2]! };
+    }
+    return null;
+}
+
 function getRegisteredOwnerNames(
     context: ResolutionContext,
     qmlName: string,
@@ -597,7 +742,7 @@ function getRegisteredOwnerNames(
     for (const node of context.getNodesByName(qmlName)) {
         const owner = node.signature?.match(registrationPattern)?.[1]
             ?? (!singletonOnly ? node.signature?.match(namedElementPattern)?.[1] : undefined);
-        if (owner) owners.add(owner.split('::').pop()!);
+        if (owner) owners.add(owner.replace(/\s*::\s*/g, '::'));
     }
     return owners;
 }
@@ -628,7 +773,8 @@ export const qtResolver: FrameworkResolver = {
     for (const file of allFiles) {
       if (!file.endsWith('.cpp') && !file.endsWith('.h') && !file.endsWith('.hpp')) continue;
       const content = context.readFile(file);
-      if (content && (QT_INCLUDE_PATTERN.test(content) || Q_OBJECT_PATTERN.test(content) || QML_ELEMENT_PATTERN.test(content))) {
+        const code = content && maskCppNonCode(content);
+        if (content && code && hasQtCppMarkers(content, code)) {
         return true;
       }
     }
@@ -660,16 +806,12 @@ export const qtResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
       const qmlEnumMember = getQmlEnumMember(ref);
       if (qmlEnumMember) {
-          const ownerParts = qmlEnumMember.ownerName.split('::');
           const candidates = context.getNodesByName(qmlEnumMember.memberName).filter(
               (node: Node) => {
                   if (node.kind !== 'enum_member') return false;
-                  const qualifiedParts = node.qualifiedName.split('::');
-                  if (qualifiedParts.at(-1) !== qmlEnumMember.memberName) return false;
-                  const ownerPath = qualifiedParts.slice(0, -1);
-                  return ownerPath.some((_, index) =>
-                      ownerParts.every((part, ownerIndex) => ownerPath[index + ownerIndex] === part),
-                  );
+                  const canonicalName = qtCanonicalName(node);
+                  return canonicalName.startsWith(`${qmlEnumMember.ownerName}::`)
+                      && canonicalName.endsWith(`::${qmlEnumMember.memberName}`);
               },
           );
           if (candidates.length === 1) {
@@ -684,33 +826,35 @@ export const qtResolver: FrameworkResolver = {
       }
 
       const contextPropertyCall = getQmlContextPropertyCall(ref);
-      if (contextPropertyCall) {
-          const registrationPrefix = `qt.context-property|${contextPropertyCall.contextName}|`;
+      const contextSignal = getQmlContextSignal(ref);
+      const contextMember = contextPropertyCall ?? contextSignal;
+      if (contextMember) {
+          const registrationPrefix = `qt.context-property|${contextMember.contextName}|`;
           const ownerTypes = new Set(
-              context.getNodesByName(contextPropertyCall.contextName)
+              context.getNodesByName(contextMember.contextName)
                   .map((node: Node) => node.signature)
                   .filter((signature): signature is string => signature?.startsWith(registrationPrefix) ?? false)
                   .map((signature) => signature.slice(registrationPrefix.length)),
           );
           if (ownerTypes.size === 0) {
-              for (const owner of getRegisteredOwnerNames(context, contextPropertyCall.contextName, true)) {
+              for (const owner of getRegisteredOwnerNames(context, contextMember.contextName, true)) {
                   ownerTypes.add(owner);
               }
           }
           if (ownerTypes.size !== 1) return null;
-          const ownerName = [...ownerTypes][0]!.split('::').pop()!;
-          const qualifiedSuffix = `::${ownerName}::${contextPropertyCall.methodName}`;
-          const candidates = context.getNodesByName(contextPropertyCall.methodName).filter(
+            const ownerName = [...ownerTypes][0]!;
+            const canonicalName = `${ownerName}::${contextMember.methodName}`;
+            const candidates = context.getNodesByName(contextMember.methodName).filter(
               (node: Node) =>
                   node.kind === 'method' &&
                   (node.language === 'cpp' || node.language === 'c') &&
-                  node.qualifiedName.endsWith(qualifiedSuffix) &&
-                  /^(?:invokable|slot) /.test(node.signature ?? ''),
+                  qtCanonicalName(node) === canonicalName &&
+                  (contextSignal ? /^signal / : /^(?:invokable|slot|signal) /).test(node.signature ?? ''),
           );
           if (candidates.length === 1) {
               return {
                   original: ref,
-                  targetNodeId: candidates[0]!.id,
+                  targetNodeId: (contextSignal ? candidates[0]! : qtExecutableTarget(candidates[0]!, context)).id,
                   confidence: 0.97,
                   resolvedBy: 'framework',
               };
@@ -720,13 +864,10 @@ export const qtResolver: FrameworkResolver = {
 
       const qmlIdCall = getQmlIdCall(ref);
       if (qmlIdCall) {
-          const ownerNames = new Set([qmlIdCall.ownerName]);
           const registeredTypes = getRegisteredOwnerNames(context, qmlIdCall.ownerName);
           if (registeredTypes.size > 1) return null;
           const hasRegisteredType = registeredTypes.size === 1;
-          if (registeredTypes.size === 1) {
-              ownerNames.add([...registeredTypes][0]!.split('::').pop()!);
-          }
+          const ownerNames = hasRegisteredType ? registeredTypes : new Set([qmlIdCall.ownerName]);
           const candidates = context.getNodesByName(qmlIdCall.methodName).filter((node: Node) => {
               if (node.language === 'qml') {
                   return (
@@ -738,13 +879,13 @@ export const qtResolver: FrameworkResolver = {
               if (node.kind !== 'method' || (node.language !== 'cpp' && node.language !== 'c')) return false;
               if (!/^(?:invokable|slot|signal) /.test(node.signature ?? '')) return false;
               return [...ownerNames].some(
-                  (ownerName) => node.qualifiedName.endsWith(`::${ownerName}::${qmlIdCall.methodName}`),
+                  (ownerName) => qtCanonicalName(node) === `${ownerName}::${qmlIdCall.methodName}`,
               );
           });
           if (candidates.length === 1) {
               return {
                   original: ref,
-                  targetNodeId: candidates[0]!.id,
+                  targetNodeId: qtExecutableTarget(candidates[0]!, context).id,
                   confidence: 0.97,
                   resolvedBy: 'framework',
               };
@@ -755,7 +896,8 @@ export const qtResolver: FrameworkResolver = {
       const ownedSignal = getOwnedQmlSignal(ref);
       if (ownedSignal) {
           const ownerNames = getRegisteredOwnerNames(context, ownedSignal.ownerName);
-          ownerNames.add(ownedSignal.ownerName);
+          if (ownerNames.size > 1) return null;
+          if (ownerNames.size === 0) ownerNames.add(ownedSignal.ownerName);
           const candidates = context.getNodesByName(ownedSignal.signalName).filter((node: Node) => {
               if (node.kind !== 'method' || !node.signature?.startsWith('signal ')) return false;
               if (node.language === 'qml') {
@@ -763,7 +905,7 @@ export const qtResolver: FrameworkResolver = {
               }
               if (node.language === 'cpp' || node.language === 'c') {
                   return [...ownerNames].some(
-                      (ownerName) => node.qualifiedName.includes(`::${ownerName}::${ownedSignal.signalName}`),
+                      (ownerName) => qtCanonicalName(node) === `${ownerName}::${ownedSignal.signalName}`,
                   );
               }
               return false;
@@ -832,11 +974,14 @@ export const qtResolver: FrameworkResolver = {
         const registeredTypes = getRegisteredOwnerNames(context, typeName);
         if (registeredTypes.size > 1) return null;
         if (registeredTypes.size === 1) {
-            const ownerName = [...registeredTypes][0]!.split('::').pop()!;
-            const registeredCandidates = context.getNodesByName(ownerName).filter(
+            const ownerName = [...registeredTypes][0]!;
+            const separator = ownerName.lastIndexOf('::');
+            const lookupName = separator < 0 ? ownerName : ownerName.slice(separator + 2);
+            const registeredCandidates = context.getNodesByName(lookupName).filter(
                 (node: Node) =>
                     node.kind === 'class' &&
-                    (node.language === 'cpp' || node.language === 'c'),
+                  (node.language === 'cpp' || node.language === 'c') &&
+                  qtCanonicalName(node) === ownerName,
             );
             if (registeredCandidates.length === 1) {
                 return {
