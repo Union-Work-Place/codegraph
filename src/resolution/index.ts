@@ -842,6 +842,7 @@ export class ReferenceResolver {
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
       rowId: ref.rowId,
+        candidates: ref.candidates,
     }));
 
     const total = refs.length;
@@ -1174,6 +1175,23 @@ export class ReferenceResolver {
     // A retained untyped chain supplies effect/call-site evidence only. In
     // particular, importing its root does not make the root its call target.
     if (isUnresolvedJsMemberCall(ref)) return null;
+
+      // Owner-qualified QML refs are terminal: if Qt cannot prove the owner,
+      // generic name matching must not guess among same-named members.
+      if (
+          ref.language === 'qml' &&
+          ref.candidates?.some(
+              (candidate) =>
+                  candidate.startsWith('qt.qml-id|') ||
+                  candidate.startsWith('qt.context-property|') ||
+                  candidate.startsWith('qt.enum-member|') ||
+                  (ref.referenceKind === 'calls' && candidate.endsWith(`::${ref.referenceName}`)),
+          )
+      ) {
+          return candidates.length > 0
+              ? candidates.reduce((best, curr) => curr.confidence > best.confidence ? curr : best)
+              : null;
+      }
 
     // Strategy 2: Try import-based resolution
     // A TS/JS/Python call-receiver chain (`useStore.getState().reset`, #1683)
@@ -1635,6 +1653,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+          candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
@@ -1755,6 +1774,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+          candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {

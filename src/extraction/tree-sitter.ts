@@ -29,6 +29,7 @@ import { SvelteExtractor } from './svelte-extractor';
 import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
+import { QmlExtractor } from './qml-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
@@ -7482,6 +7483,10 @@ export function extractFromSource(
   } else if (detectedLanguage === 'vue') {
     // Use custom extractor for Vue
     const extractor = new VueExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'qml') {
+    // Use custom extractor for Qt QML declarative UI
+    const extractor = new QmlExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'astro') {
     // Use custom extractor for Astro (frontmatter + template delegation)

@@ -1773,11 +1773,75 @@ export function isCppConstructorDeclaration(node: SyntaxNode): boolean {
     && getChildByField(declarator, 'declarator')?.text === getChildByField(owner, 'name')?.text;
 }
 
+/**
+ * Blank Qt-specific macros that cause tree-sitter to misparse C++ class bodies.
+ *
+ * - `Q_OBJECT` / `Q_GADGET` / `Q_NAMESPACE`: zero-arg macros inside class bodies
+ *   that tree-sitter may parse as variable declarations, polluting the symbol table.
+ *   Replaced with equal-length spaces to preserve byte offsets.
+ *
+ * - `signals:` / `Q_SIGNALS:` → `public:` / spaces+`:` (length-preserving):
+ *   tree-sitter doesn't know `signals` is an access specifier alias. Replacing it
+ *   with `public:` (which is shorter) is not byte-safe, so we blank the keyword
+ *   portion and keep the `:`. This leaves `        :` on the line, which tree-sitter
+ *   parses as a lone labeled statement, but the actual function declarations that
+ *   follow are still extracted by the Qt framework resolver's `extract()` pass,
+ *   so no symbols are lost.
+ *
+ * - `Q_INVOKABLE` (7 chars → 7 spaces): marks methods visible to QML. Blanking it
+ *   lets tree-sitter see a clean return type and extract the method normally.
+ */
+export function blankQtMacros(source: string): string {
+  // Fast path: not a Qt file
+  if (!source.includes('Q_OBJECT') && !source.includes('Q_GADGET') &&
+      !source.includes('signals') && !source.includes('Q_SIGNALS') &&
+      !source.includes('slots') && !source.includes('Q_SLOTS') &&
+      !source.includes('Q_INVOKABLE') &&
+      !source.includes('QML_ELEMENT') && !source.includes('QML_NAMED_ELEMENT') &&
+      !source.includes('QML_SINGLETON') && !source.includes('QML_UNCREATABLE') &&
+      !source.includes('QML_INTERFACE') && !source.includes('QML_VALUE_TYPE') &&
+      !source.includes('QML_ANONYMOUS')) {
+    return source;
+  }
+
+  return source
+    // Blank zero-arg class macros (preserve byte count)
+    .replace(/\bQ_OBJECT\b/g, (m) => ' '.repeat(m.length))
+    .replace(/\bQ_GADGET\b/g, (m) => ' '.repeat(m.length))
+    .replace(/\bQ_NAMESPACE\b/g, (m) => ' '.repeat(m.length))
+    // Blank Q_INVOKABLE (return type follows immediately after — keep the space)
+    .replace(/\bQ_INVOKABLE\b/g, (m) => ' '.repeat(m.length))
+    // Blank Q_REQUIRED_RESULT, Q_DECL_OVERRIDE, Q_DECL_FINAL (Qt 4/5 compat macros)
+    .replace(/\bQ_(?:REQUIRED_RESULT|DECL_OVERRIDE|DECL_FINAL|DECL_NOEXCEPT|DECL_DEPRECATED(?:_X)?|DECL_UNUSED|DECL_PURE_VIRTUAL)\b/g, (m) => ' '.repeat(m.length))
+    // Blank signals:/Q_SIGNALS: keyword (keep the colon for brace-balance)
+    .replace(/\b(Q_SIGNALS|signals)\s*(?=:)/g, (m) => ' '.repeat(m.length))
+    // Blank slots:/Q_SLOTS: keyword (keep the colon)
+    .replace(/\b(Q_SLOTS|slots)\s*(?=:)/g, (m) => ' '.repeat(m.length))
+    // Qt 6 QML registration macros — blank with arguments (parenthesised forms)
+    // e.g. QML_NAMED_ELEMENT(Counter), QML_UNCREATABLE("reason"), QML_VALUE_TYPE(point)
+    .replace(/\bQML_(?:NAMED_ELEMENT|UNCREATABLE|VALUE_TYPE|ANONYMOUS)\s*\([^)]*\)/g, (m) => ' '.repeat(m.length))
+    // Blank zero-arg Qt 6 QML macros
+    .replace(/\bQML_(?:ELEMENT|SINGLETON|INTERFACE|FOREIGN\s*\([^)]*\))\b/g, (m) => ' '.repeat(m.length));
+}
+
+/**
+ * Combined preParse for C++: blank Qt macros first, then run the full
+ * macro-recovery pipeline (`preParseCppSource`) so both feature sets apply —
+ * Qt class macros (Q_OBJECT, Q_INVOKABLE, signals:/slots:) and the broader
+ * macro-annotated class/function recovery.
+ */
+export function cppPreParse(source: string, filePath?: string): string {
+  return preParseCppSource(blankQtMacros(source), filePath);
+}
+
 export const cppExtractor: LanguageExtractor = {
   // Recover macro-annotated class/struct definitions (`class MYMODULE_API Foo : Base`,
   // #1061/#946) and macro-prefixed functions (`FORCEINLINE FString Foo()`, #1093
   // follow-up) that tree-sitter otherwise misparses.
-  preParse: preParseCppSource,
+  // Also blanks Qt class macros (Q_OBJECT, Q_INVOKABLE, signals:, slots:) so the
+  // surrounding C++ parses cleanly; Qt signal/slot method nodes are extracted by
+  // the Qt framework resolver's extract() pass.
+  preParse: cppPreParse,
   // Universal net for any macro the curated blank list misses.
   recoverMangledName: recoverMangledCppName,
   functionTypes: ['function_definition'],

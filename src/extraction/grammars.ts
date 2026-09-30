@@ -11,7 +11,7 @@ import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'qml' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -123,6 +123,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
+  // Qt/QML declarative UI files
+  '.qml': 'qml',
   '.sol': 'solidity',
   // CFML: .cfc/.cfm parse with the tag-aware `cfml` grammar (custom CfmlExtractor
   // dialect-switches to cfscript for bare-script content); .cfs is pure CFScript.
@@ -501,6 +503,12 @@ export async function loadAllGrammars(): Promise<void> {
   await loadGrammarsForLanguages(allLanguages);
 }
 
+export function includeEmbeddedGrammarDependencies(languages: Language[]): Language[] {
+  const required = new Set(languages);
+  if (required.has('qml')) required.add('javascript');
+  return [...required];
+}
+
 /**
  * Check if grammars have been initialized
  */
@@ -680,7 +688,7 @@ export function isFileLevelOnlyLanguage(language: Language): boolean {
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'astro', 'liquid'];
+  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'astro', 'liquid', 'qml'];
 }
 
 /**
@@ -760,6 +768,7 @@ export function getLanguageDisplayName(language: Language): string {
     twig: 'Twig',
     xml: 'XML',
     properties: 'Java properties',
+    qml: 'QML',
     cfml: 'CFML',
     cfscript: 'CFScript',
     cfquery: 'CFQuery (SQL)',
