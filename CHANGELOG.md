@@ -12,6 +12,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Qt and QML projects are now indexed: `.qml` files are parsed, and CodeGraph follows a flow from a QML handler into the C++ it triggers through signals and slots (including `connect(…)` with the `SIGNAL`/`SLOT` macros or member pointers, `emit` and `Q_EMIT`), `Q_INVOKABLE` methods, `Q_PROPERTY`, context objects, typed `id`s, registered QML types, enum values and `Connections` blocks. Names that are shadowed or have more than one possible owner are left unlinked instead of guessed, and QML written with the opening brace on its own line is read too. `codegraph_explore` can now trace a QML button to the C++ code behind it.
+- Qt macros in C++ files no longer disturb the parser: source positions stay exact, comments and string literals are untouched, and QML objects, bindings and multi-line functions keep their place in the component hierarchy with their full bodies.
+
 ### Fixes
 
 - A Dart call like `ext.endsWith(".avi")` or `map.putIfAbsent(…)` on a value whose type isn't known now counts as Dart's own String, List or Map method. It no longer lands on a project method of the same name. A Dart extension is also matched by the type it extends, not by its own name, so getx's `ext.endsWith` on a String stopped reaching `extension RxStringExt on Rx<String>`.
