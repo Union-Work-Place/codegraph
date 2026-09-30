@@ -83,6 +83,12 @@ const RE_INLINE_COMPONENT = /^\s*component\s+([A-Z][A-Za-z0-9]*)\s*:\s*([A-Z][A-
 /** id: identifier */
 const RE_ID = /^\s*id\s*:\s*(\w+)/;
 
+/** Literal Connections target: target: backend */
+const RE_CONNECTIONS_TARGET = /^\s*target\s*:\s*([A-Za-z_$][\w$]*)\s*;?\s*$/;
+
+/** Any Connections target assignment, including dynamic expressions. */
+const RE_CONNECTIONS_TARGET_ASSIGNMENT = /^\s*target\s*:/;
+
 /** enum declaration inside QML: enum Name { } */
 const RE_ENUM = /^\s*enum\s+(\w+)\s*\{/;
 
@@ -98,6 +104,96 @@ interface ComponentFrame {
     ownerName: string;
     isGrouping?: boolean;
   qmlId?: string;
+    connectionsTarget?: string;
+}
+
+interface QmlLexicalState {
+    inBlockComment: boolean;
+    quote: '"' | "'" | '`' | null;
+    escaped: boolean;
+}
+
+interface QmlLexicalLine {
+    code: string;
+    braces: Array<{ index: number; value: '{' | '}' }>;
+}
+
+function scanQmlLine(rawLine: string, state: QmlLexicalState): QmlLexicalLine {
+    const code = rawLine.split('');
+    const braces: QmlLexicalLine['braces'] = [];
+
+    for (let index = 0; index < rawLine.length; index++) {
+        const character = rawLine[index]!;
+        const nextCharacter = rawLine[index + 1];
+
+        if (state.inBlockComment) {
+            code[index] = ' ';
+            if (character === '*' && nextCharacter === '/') {
+                code[index + 1] = ' ';
+                state.inBlockComment = false;
+                index++;
+            }
+            continue;
+        }
+
+        if (state.quote) {
+            if (state.escaped) {
+                state.escaped = false;
+                continue;
+            }
+            if (character === '\\') {
+                state.escaped = true;
+                continue;
+            }
+            if (character === state.quote) state.quote = null;
+            continue;
+        }
+
+        if (character === '/' && nextCharacter === '/') {
+            for (let commentIndex = index; commentIndex < code.length; commentIndex++) code[commentIndex] = ' ';
+            break;
+        }
+        if (character === '/' && nextCharacter === '*') {
+            code[index] = ' ';
+            code[index + 1] = ' ';
+            state.inBlockComment = true;
+            index++;
+            continue;
+        }
+        if (character === '"' || character === "'" || character === '`') {
+            state.quote = character;
+            continue;
+        }
+        if (character === '{' || character === '}') braces.push({ index, value: character });
+    }
+
+    if (state.quote && state.quote !== '`') {
+        const continuesOnNextLine = state.escaped;
+        state.escaped = false;
+        if (!continuesOnNextLine) state.quote = null;
+    } else {
+        state.escaped = false;
+    }
+
+    return { code: code.join(''), braces };
+}
+
+function findStructuralBrace(line: QmlLexicalLine, value: '{' | '}', startIndex = 0): number {
+    return line.braces.find((brace) => brace.value === value && brace.index >= startIndex)?.index ?? -1;
+}
+
+function consumeStructuralBraces(
+    line: QmlLexicalLine,
+    initialDepth: number,
+    startIndex = 0,
+): { depth: number; closed: boolean } {
+    let depth = initialDepth;
+    for (const brace of line.braces) {
+        if (brace.index < startIndex) continue;
+        depth += brace.value === '{' ? 1 : -1;
+        if (depth === 0) return { depth, closed: true };
+    }
+    return { depth, closed: false };
 }
 
 export class QmlExtractor {
@@ -153,6 +249,12 @@ export class QmlExtractor {
     const stack: ComponentFrame[] = [];
       const qmlIdTypes = new Map<string, Set<string>>();
       const qmlIdNodeIds = new Map<string, Set<string>>();
+      const connectionsHandlers: Array<{
+          nodeId: string;
+          handlerName: string;
+          line: number;
+          frame: ComponentFrame;
+      }> = [];
 
     // The outermost component is named after the .qml file
     const fileName = this.filePath.split(/[/\\]/).pop() ?? this.filePath;
@@ -175,42 +277,32 @@ export class QmlExtractor {
 
     // Track overall brace depth (lines with excess `{` can open a component)
     let braceBalance = 0;
+      const lexicalState: QmlLexicalState = { inBlockComment: false, quote: null, escaped: false };
 
     for (let i = 0; i < lines.length; i++) {
       const rawLine = lines[i] ?? '';
       const lineNum = i + 1;
-
-      // ------------------------------------------------------------------
-      // Strip inline // comments for pattern matching (but keep the line
-      // length by replacing with spaces to preserve column positions).
-      // Simple heuristic — doesn't handle comments inside strings.
-      // ------------------------------------------------------------------
-      const commentIdx = rawLine.indexOf('//');
-      const line = commentIdx >= 0 ? rawLine.slice(0, commentIdx) : rawLine;
+        const lexicalLine = scanQmlLine(rawLine, lexicalState);
+        const line = lexicalLine.code;
 
       // ------------------------------------------------------------------
       // If we are inside a JS function body, collect lines until depth=0
       // ------------------------------------------------------------------
       if (jsFunctionNodeId !== null) {
         jsBodyLines.push(rawLine);
-        for (const ch of rawLine) {
-          if (ch === '{') jsBodyDepth++;
-          else if (ch === '}') {
-            jsBodyDepth--;
-            if (jsBodyDepth === 0) {
+          const bodyBalance = consumeStructuralBraces(lexicalLine, jsBodyDepth);
+          jsBodyDepth = bodyBalance.depth;
+          if (bodyBalance.closed) {
               // End of function body — delegate to JS extractor
               this.extractJsBody(
-                jsBodyLines.join('\n'),
-                jsBodyStartLine,
-                jsFunctionNodeId,
-                jsFunctionParentId ?? (stack[stack.length - 1]?.nodeId ?? ''),
+                  jsBodyLines.join('\n'),
+                  jsBodyStartLine,
+                  jsFunctionNodeId,
+                  jsFunctionParentId ?? (stack[stack.length - 1]?.nodeId ?? ''),
               );
               jsFunctionNodeId = null;
               jsFunctionParentId = null;
               jsBodyLines = [];
-              break;
-            }
-          }
         }
         continue;
       }
@@ -266,8 +358,8 @@ export class QmlExtractor {
           stack.push({ nodeId, startLine: lineNum, typeName: inlineName!, ownerName: inlineName! });
         braceBalance++;
         braceDepth.push(lineNum);
-          const inlineBody = line.slice(line.indexOf('{'));
-          if ((inlineBody.match(/\{/g)?.length ?? 0) === (inlineBody.match(/\}/g)?.length ?? 0)) {
+          const inlineBrace = findStructuralBrace(lexicalLine, '{');
+          if (inlineBrace >= 0 && consumeStructuralBraces(lexicalLine, 0, inlineBrace).closed) {
               stack.pop();
               braceBalance--;
               braceDepth.pop();
@@ -372,8 +464,8 @@ export class QmlExtractor {
 
         braceBalance++;
         braceDepth.push(lineNum);
-          const componentBody = line.slice(line.indexOf('{'));
-          if ((componentBody.match(/\{/g)?.length ?? 0) === (componentBody.match(/\}/g)?.length ?? 0)) {
+          const componentBrace = findStructuralBrace(lexicalLine, '{');
+          if (componentBrace >= 0 && consumeStructuralBraces(lexicalLine, 0, componentBrace).closed) {
               const frame = stack.pop();
               braceBalance--;
               braceDepth.pop();
@@ -414,44 +506,32 @@ export class QmlExtractor {
           braceBalance++;
 
           // Process the rest of the opening line — may contain members and close
-          const afterBrace = line.slice(line.indexOf('{') + 1);
+            const enumBrace = findStructuralBrace(lexicalLine, '{');
+            const afterBrace = line.slice(enumBrace + 1);
           this.extractEnumLineMembers(afterBrace, enumName, nodeId, lineNum);
           // Check if the enum closes on the same line
-          let depth = 1;
-          for (const ch of afterBrace) {
-            if (ch === '{') depth++;
-            else if (ch === '}') {
-              depth--;
-              if (depth === 0) {
+            const enumBalance = consumeStructuralBraces(lexicalLine, 0, enumBrace);
+            enumDepth = enumBalance.depth;
+            if (enumBalance.closed) {
                 enumNode.endLine = lineNum;
                 enumNodeId = null;
                 enumDepth = 0;
                 braceBalance--;
-                break;
-              }
-            }
           }
           continue;
         }
       } else {
         // Track depth and extract enum members
-        let closed = false;
-        for (const ch of line) {
-          if (ch === '{') enumDepth++;
-          else if (ch === '}') {
-            enumDepth--;
-            if (enumDepth === 0) {
+          const enumBalance = consumeStructuralBraces(lexicalLine, enumDepth);
+          enumDepth = enumBalance.depth;
+          if (enumBalance.closed) {
               const enumNode = this.nodes.find((n) => n.id === enumNodeId);
               if (enumNode) enumNode.endLine = lineNum;
               enumNodeId = null;
               braceBalance--;
-              closed = true;
-              break;
-            }
-          }
         }
         // Extract member identifier from lines inside the enum body
-        if (!closed && enumDepth > 0 && enumNodeId) {
+          if (!enumBalance.closed && enumDepth > 0 && enumNodeId) {
           this.extractEnumLineMembers(line, enumName, enumNodeId, lineNum);
         }
         continue;
@@ -502,6 +582,11 @@ export class QmlExtractor {
         }
         continue;
       }
+
+        if (currentFrame.typeName === 'Connections' && RE_CONNECTIONS_TARGET_ASSIGNMENT.test(line)) {
+            currentFrame.connectionsTarget = line.match(RE_CONNECTIONS_TARGET)?.[1];
+            continue;
+        }
 
       // property T name [: value]
       const propMatch = line.match(RE_PROPERTY);
@@ -560,7 +645,9 @@ export class QmlExtractor {
       const funcMatch = line.match(RE_FUNCTION);
       if (funcMatch) {
         const [, funcName, funcParams] = funcMatch;
-        const nodeId = generateNodeId(this.filePath, 'function', funcName!, lineNum);
+          const isConnectionsHandler =
+              currentFrame.typeName === 'Connections' && /^on[A-Z][A-Za-z0-9]*$/.test(funcName!);
+          const nodeId = generateNodeId(this.filePath, isConnectionsHandler ? 'method' : 'function', funcName!, lineNum);
           const parameterNames = new Set(
               (funcParams ?? '')
                   .split(',')
@@ -570,7 +657,7 @@ export class QmlExtractor {
           this.jsLocalNames.set(nodeId, parameterNames);
         const node: Node = {
           id: nodeId,
-          kind: 'function',
+            kind: isConnectionsHandler ? 'method' : 'function',
           name: funcName!,
           qualifiedName: `${this.filePath}::${funcName}`,
           filePath: this.filePath,
@@ -579,31 +666,35 @@ export class QmlExtractor {
           endLine: lineNum, // patched when body ends
           startColumn: (line.match(/^\s*/)?.[0].length ?? 0),
           endColumn: 0,
-          signature: `function ${funcName}(${funcParams ?? ''})`,
+            signature: isConnectionsHandler
+                ? `handler ${funcName}`
+                : `function ${funcName}(${funcParams ?? ''})`,
           updatedAt: Date.now(),
         };
         this.nodes.push(node);
         this.edges.push({ source: currentFrame.nodeId, target: nodeId, kind: 'contains' });
+          if (isConnectionsHandler) {
+              connectionsHandlers.push({ nodeId, handlerName: funcName!, line: lineNum, frame: currentFrame });
+          }
 
         // Start collecting the function body for JS extraction
-        const braceInLine = rawLine.indexOf('{');
+          const braceInLine = findStructuralBrace(
+              lexicalLine,
+              '{',
+              (funcMatch.index ?? 0) + funcMatch[0].length,
+          );
         if (braceInLine >= 0) {
           jsFunctionNodeId = nodeId;
           jsFunctionParentId = currentFrame.nodeId;
           jsBodyStartLine = lineNum;
           jsBodyLines = [rawLine.slice(braceInLine)];
-          jsBodyDepth = 1;
-          // count any } on this same line
-          for (let ci = braceInLine + 1; ci < rawLine.length; ci++) {
-            if (rawLine[ci] === '{') jsBodyDepth++;
-            else if (rawLine[ci] === '}') {
-              jsBodyDepth--;
-              if (jsBodyDepth === 0) {
+            const bodyBalance = consumeStructuralBraces(lexicalLine, 0, braceInLine);
+            jsBodyDepth = bodyBalance.depth;
+            if (bodyBalance.closed) {
                 this.extractJsBody(jsBodyLines.join('\n'), jsBodyStartLine, nodeId, currentFrame.nodeId);
                 jsFunctionNodeId = null;
-                break;
-              }
-            }
+              jsFunctionParentId = null;
+              jsBodyLines = [];
           }
         }
         continue;
@@ -638,7 +729,7 @@ export class QmlExtractor {
           this.unresolvedRefs.push({
               fromNodeId: handlerNodeId,
             referenceName: signalName,
-            referenceKind: 'calls',
+              referenceKind: 'references',
             line: lineNum,
             column: 0,
             filePath: this.filePath,
@@ -647,26 +738,22 @@ export class QmlExtractor {
           });
         }
           // Handle block and arrow-function handler bodies as embedded JS.
-        const braceInLine = rawLine.lastIndexOf('{');
+          const braceInLine = findStructuralBrace(lexicalLine, '{', handlerMatch.index ?? 0);
           if (braceInLine >= 0) {
           jsFunctionNodeId = handlerNodeId;
           jsFunctionParentId = currentFrame.nodeId;
           jsBodyStartLine = lineNum;
           jsBodyLines = [rawLine.slice(braceInLine)];
-          jsBodyDepth = 1;
-          for (let ci = braceInLine + 1; ci < rawLine.length; ci++) {
-            if (rawLine[ci] === '{') jsBodyDepth++;
-            else if (rawLine[ci] === '}') {
-              jsBodyDepth--;
-              if (jsBodyDepth === 0) {
-                this.extractJsBody(jsBodyLines.join('\n'), jsBodyStartLine, handlerNodeId, currentFrame.nodeId);
-                jsFunctionNodeId = null;
-                break;
-              }
-            }
+              const bodyBalance = consumeStructuralBraces(lexicalLine, 0, braceInLine);
+              jsBodyDepth = bodyBalance.depth;
+              if (bodyBalance.closed) {
+                  this.extractJsBody(jsBodyLines.join('\n'), jsBodyStartLine, handlerNodeId, currentFrame.nodeId);
+                  jsFunctionNodeId = null;
+              jsFunctionParentId = null;
+              jsBodyLines = [];
           }
           } else {
-              const colonInLine = rawLine.indexOf(':');
+              const colonInLine = line.indexOf(':');
               if (colonInLine >= 0) {
                   this.extractJsBody(rawLine.slice(colonInLine + 1), lineNum, handlerNodeId, currentFrame.nodeId);
               }
@@ -703,7 +790,7 @@ export class QmlExtractor {
         this.unresolvedRefs.push({
           fromNodeId: nodeId,
           referenceName: signalName,
-          referenceKind: 'calls',
+            referenceKind: 'references',
           line: lineNum,
           column: 0,
           filePath: this.filePath,
@@ -723,26 +810,22 @@ export class QmlExtractor {
               });
           }
 
-          const braceInLine = rawLine.lastIndexOf('{');
+          const braceInLine = findStructuralBrace(lexicalLine, '{', attachedMatch.index ?? 0);
           if (braceInLine >= 0) {
               jsFunctionNodeId = nodeId;
               jsFunctionParentId = currentFrame.nodeId;
               jsBodyStartLine = lineNum;
               jsBodyLines = [rawLine.slice(braceInLine)];
-              jsBodyDepth = 1;
-              for (let ci = braceInLine + 1; ci < rawLine.length; ci++) {
-                  if (rawLine[ci] === '{') jsBodyDepth++;
-                  else if (rawLine[ci] === '}') {
-                      jsBodyDepth--;
-                      if (jsBodyDepth === 0) {
-                          this.extractJsBody(jsBodyLines.join('\n'), jsBodyStartLine, nodeId, currentFrame.nodeId);
-                          jsFunctionNodeId = null;
-                          break;
-                      }
-                  }
+              const bodyBalance = consumeStructuralBraces(lexicalLine, 0, braceInLine);
+              jsBodyDepth = bodyBalance.depth;
+              if (bodyBalance.closed) {
+                  this.extractJsBody(jsBodyLines.join('\n'), jsBodyStartLine, nodeId, currentFrame.nodeId);
+                  jsFunctionNodeId = null;
+                  jsFunctionParentId = null;
+                  jsBodyLines = [];
               }
           } else {
-              const colonInLine = rawLine.indexOf(':');
+              const colonInLine = line.indexOf(':');
               if (colonInLine >= 0) {
                   this.extractJsBody(rawLine.slice(colonInLine + 1), lineNum, nodeId, currentFrame.nodeId);
               }
@@ -754,9 +837,9 @@ export class QmlExtractor {
       // Any remaining lines with a { that we haven't matched as a component
       // still increment the brace balance so the stack stays correct.
       // ------------------------------------------------------------------
-      for (const ch of rawLine) {
-        if (ch === '{') { braceBalance++; braceDepth.push(lineNum); }
-        else if (ch === '}' && braceBalance > 0) {
+        for (const brace of lexicalLine.braces) {
+            if (brace.value === '{') { braceBalance++; braceDepth.push(lineNum); }
+            else if (brace.value === '}' && braceBalance > 0) {
           braceBalance--;
           braceDepth.pop();
           if (stack.length > 0) {
@@ -771,13 +854,14 @@ export class QmlExtractor {
       }
     }
 
+      this.linkConnectionsSignalHandlers(connectionsHandlers, qmlIdTypes, qmlIdNodeIds);
       this.linkLocalComponentFactories(qmlIdTypes, qmlIdNodeIds);
       this.annotateQmlMemberReferences(qmlIdTypes);
       this.linkLocalEnumAccesses();
 
     // Patch root component endLine to cover the whole file
-    if (this.nodes.length > 0) {
-      const root = this.nodes[0];
+      {
+          const root = this.nodes.find((node) => node.kind === 'component' && node.name === componentName);
       if (root && root.startLine > 0) {
         root.endLine = lines.length;
       }
@@ -858,6 +942,31 @@ export class QmlExtractor {
   // -------------------------------------------------------------------------
   // JS body delegation
   // -------------------------------------------------------------------------
+
+    private linkConnectionsSignalHandlers(
+        handlers: Array<{ nodeId: string; handlerName: string; line: number; frame: ComponentFrame }>,
+        qmlIdTypes: Map<string, Set<string>>,
+        qmlIdNodeIds: Map<string, Set<string>>,
+    ): void {
+        for (const handler of handlers) {
+            const targetId = handler.frame.connectionsTarget;
+            const types = targetId ? qmlIdTypes.get(targetId) : undefined;
+            const nodeIds = targetId ? qmlIdNodeIds.get(targetId) : undefined;
+            if (types?.size !== 1 || nodeIds?.size !== 1) continue;
+
+            const signalName = handler.handlerName[2]!.toLowerCase() + handler.handlerName.slice(3);
+            this.unresolvedRefs.push({
+                fromNodeId: handler.nodeId,
+                referenceName: signalName,
+                referenceKind: 'references',
+                line: handler.line,
+                column: 0,
+                filePath: this.filePath,
+                language: 'qml',
+                candidates: [`${[...types][0]!}::${signalName}`],
+            });
+        }
+    }
 
     private annotateQmlMemberReferences(qmlIdTypes: Map<string, Set<string>>): void {
         for (const ref of this.unresolvedRefs) {

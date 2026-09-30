@@ -28,6 +28,10 @@ describe('QML persisted signal resolution', () => {
       'import QtQuick\nItem {\n    signal clicked()\n}\n',
     );
     fs.writeFileSync(
+        path.join(tempDir, 'AttachedWidget.qml'),
+        'import QtQuick\nItem {\n    signal activated()\n}\n',
+    );
+      fs.writeFileSync(
       path.join(tempDir, 'Main.qml'),
       `import QtQuick
 Item {
@@ -40,6 +44,7 @@ Item {
     BetaButton {
         onClicked: {}
     }
+    AttachedWidget.onActivated: {}
     MainBarButton {
         onClicked: {}
     }
@@ -64,6 +69,9 @@ Item {
       const betaSignal = graph.getNodesInFile('BetaButton.qml').find(
         (node) => node.kind === 'method' && node.name === 'clicked',
       );
+        const activatedSignal = graph.getNodesInFile('AttachedWidget.qml').find(
+            (node) => node.kind === 'method' && node.name === 'activated',
+        );
       const mainNodes = graph.getNodesInFile('Main.qml');
       const readySignal = mainNodes.find((node) => node.kind === 'method' && node.name === 'ready');
       const readyHandler = mainNodes.find((node) => node.kind === 'method' && node.name === 'onReady');
@@ -73,16 +81,21 @@ Item {
       const completedHandler = mainNodes.find(
         (node) => node.kind === 'method' && node.name === 'Component.onCompleted',
       );
+        const attachedHandler = mainNodes.find(
+            (node) => node.kind === 'method' && node.name === 'AttachedWidget.onActivated',
+        );
       const clickHandlers = mainNodes
         .filter((node) => node.kind === 'method' && node.name === 'onClicked')
         .sort((left, right) => left.startLine - right.startLine);
 
       expect(alphaSignal).toBeDefined();
       expect(betaSignal).toBeDefined();
+        expect(activatedSignal).toBeDefined();
       expect(readySignal).toBeDefined();
       expect(readyHandler).toBeDefined();
       expect(finishStartup).toBeDefined();
       expect(completedHandler).toBeDefined();
+        expect(attachedHandler).toBeDefined();
       expect(clickHandlers).toHaveLength(3);
 
       const callTargets = (nodeId: string) =>
@@ -91,8 +104,14 @@ Item {
           .map((edge) => edge.target);
       const callEdges = (nodeId: string) =>
         graph.getOutgoingEdges(nodeId).filter((edge) => edge.kind === 'calls');
-      const qualifiedTargets = (nodeId: string) => {
-        const targetIds = new Set(callTargets(nodeId));
+        const referenceTargets = (nodeId: string) =>
+            graph.getOutgoingEdges(nodeId)
+                .filter((edge) => edge.kind === 'references')
+                .map((edge) => edge.target);
+        const referenceEdges = (nodeId: string) =>
+            graph.getOutgoingEdges(nodeId).filter((edge) => edge.kind === 'references');
+        const qualifiedReferenceTargets = (nodeId: string) => {
+            const targetIds = new Set(referenceTargets(nodeId));
         return [
           ...graph.getNodesInFile('AlphaButton.qml'),
           ...graph.getNodesInFile('BetaButton.qml'),
@@ -101,13 +120,32 @@ Item {
           .filter((node) => targetIds.has(node.id))
           .map((node) => node.qualifiedName);
       };
+        const synthesized = (sourceId: string, targetId: string) =>
+            graph.getOutgoingEdges(sourceId).find(
+                (edge) =>
+                    edge.kind === 'calls' &&
+                    edge.target === targetId &&
+                    edge.provenance === 'heuristic' &&
+                    edge.metadata?.synthesizedBy === 'qt-signal-channel',
+            );
 
-      expect(callTargets(readyHandler!.id)).toEqual([readySignal!.id]);
-      expect(qualifiedTargets(clickHandlers[0]!.id)).toEqual(['AlphaButton.qml::clicked']);
-      expect(qualifiedTargets(clickHandlers[1]!.id)).toEqual(['BetaButton.qml::clicked']);
-      expect(qualifiedTargets(clickHandlers[2]!.id)).toEqual([]);
-      expect(callEdges(clickHandlers[0]!.id)[0]?.metadata).toMatchObject({ resolvedBy: 'framework' });
-      expect(callEdges(clickHandlers[1]!.id)[0]?.metadata).toMatchObject({ resolvedBy: 'framework' });
+        expect(callTargets(readyHandler!.id)).not.toContain(readySignal!.id);
+        expect(referenceTargets(readyHandler!.id)).toEqual([readySignal!.id]);
+        expect(qualifiedReferenceTargets(clickHandlers[0]!.id)).toEqual(['AlphaButton.qml::clicked']);
+        expect(qualifiedReferenceTargets(clickHandlers[1]!.id)).toEqual(['BetaButton.qml::clicked']);
+        expect(qualifiedReferenceTargets(clickHandlers[2]!.id)).toEqual([]);
+        expect(callTargets(clickHandlers[0]!.id)).not.toContain(alphaSignal!.id);
+        expect(callTargets(clickHandlers[1]!.id)).not.toContain(betaSignal!.id);
+        expect(referenceEdges(clickHandlers[0]!.id)[0]?.metadata).toMatchObject({ resolvedBy: 'framework' });
+        expect(referenceEdges(clickHandlers[1]!.id)[0]?.metadata).toMatchObject({ resolvedBy: 'framework' });
+        expect(synthesized(readySignal!.id, readyHandler!.id)).toMatchObject({
+            metadata: expect.objectContaining({ registeredAt: 'Main.qml:4' }),
+        });
+        expect(synthesized(alphaSignal!.id, clickHandlers[0]!.id)).toBeDefined();
+        expect(synthesized(betaSignal!.id, clickHandlers[1]!.id)).toBeDefined();
+        expect(callTargets(attachedHandler!.id)).not.toContain(activatedSignal!.id);
+        expect(referenceTargets(attachedHandler!.id)).toContain(activatedSignal!.id);
+        expect(synthesized(activatedSignal!.id, attachedHandler!.id)).toBeDefined();
       expect(callTargets(completedHandler!.id)).toContain(finishStartup!.id);
       expect(graph.getOutgoingEdges(completedHandler!.id)).not.toEqual(
         expect.arrayContaining([expect.objectContaining({ kind: 'references' })]),
@@ -489,8 +527,164 @@ void registerTypes() {
       const handler = graph.getNodesInFile('Main.qml').find((node) => node.name === 'onUpdated');
       const signal = graph.getNodesInFile('internal-panel.h').find((node) => node.name === 'updated');
       expect(graph.getOutgoingEdges(handler!.id)).toEqual(expect.arrayContaining([
+          expect.objectContaining({ kind: 'references', target: signal!.id }),
+      ]));
+        expect(graph.getOutgoingEdges(handler!.id)).not.toEqual(expect.arrayContaining([
         expect.objectContaining({ kind: 'calls', target: signal!.id }),
       ]));
+          expect(graph.getOutgoingEdges(signal!.id)).toEqual(expect.arrayContaining([
+              expect.objectContaining({
+                  kind: 'calls',
+                  target: handler!.id,
+                  provenance: 'heuristic',
+                  metadata: expect.objectContaining({
+                      synthesizedBy: 'qt-signal-channel',
+                      registeredAt: 'Main.qml:4',
+                  }),
+              }),
+          ]));
+      } finally {
+          graph.close();
+      }
+  });
+
+    it('resolves a Connections handler only to its literal target type and extracts its body once', async () => {
+        tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-qml-connections-target-'));
+        fs.writeFileSync(
+            path.join(tempDir, 'native-panel.h'),
+            `#include <QObject>
+class NativePanel : public QObject {
+    Q_OBJECT
+signals:
+    void updated();
+public:
+    Q_INVOKABLE void refresh();
+};
+`,
+        );
+        fs.writeFileSync(
+            path.join(tempDir, 'other-panel.h'),
+            `#include <QObject>
+class OtherPanel : public QObject {
+    Q_OBJECT
+signals:
+    void updated();
+};
+`,
+        );
+        fs.writeFileSync(
+            path.join(tempDir, 'Main.qml'),
+            `import QtQuick
+Item {
+    NativePanel {
+        id: backend
+    }
+    Connections {
+        target: backend
+        function onUpdated() {
+            backend.refresh()
+        }
+    }
+}
+`,
+        );
+
+        const graph = CodeGraph.initSync(tempDir);
+        try {
+            expect((await graph.indexAll()).success).toBe(true);
+            const mainNodes = graph.getNodesInFile('Main.qml');
+            const connections = mainNodes.find((node) => node.kind === 'component' && node.name === 'Connections');
+            const handler = mainNodes.find((node) => node.kind === 'method' && node.name === 'onUpdated');
+            const nativeSignal = graph.getNodesInFile('native-panel.h').find((node) => node.name === 'updated');
+            const otherSignal = graph.getNodesInFile('other-panel.h').find((node) => node.name === 'updated');
+            const refresh = graph.getNodesInFile('native-panel.h').find((node) => node.name === 'refresh');
+
+            expect(connections).toBeDefined();
+            expect(handler).toMatchObject({ signature: 'handler onUpdated' });
+            expect(nativeSignal).toBeDefined();
+            expect(otherSignal).toBeDefined();
+            expect(refresh).toBeDefined();
+            expect(graph.getOutgoingEdges(connections!.id)).toEqual(expect.arrayContaining([
+                expect.objectContaining({ kind: 'contains', target: handler!.id }),
+            ]));
+
+            const calls = graph.getOutgoingEdges(handler!.id).filter((edge) => edge.kind === 'calls');
+            expect(calls).toEqual(expect.arrayContaining([
+                expect.objectContaining({ target: refresh!.id }),
+            ]));
+            expect(calls).not.toEqual(expect.arrayContaining([
+                expect.objectContaining({ target: nativeSignal!.id }),
+                expect.objectContaining({ target: otherSignal!.id }),
+            ]));
+            expect(graph.getOutgoingEdges(handler!.id)).toEqual(expect.arrayContaining([
+                expect.objectContaining({ kind: 'references', target: nativeSignal!.id }),
+            ]));
+            expect(graph.getOutgoingEdges(handler!.id)).not.toEqual(expect.arrayContaining([
+                expect.objectContaining({ kind: 'references', target: otherSignal!.id }),
+            ]));
+            expect(graph.getOutgoingEdges(nativeSignal!.id)).toEqual(expect.arrayContaining([
+                expect.objectContaining({
+                    kind: 'calls',
+                    target: handler!.id,
+                    provenance: 'heuristic',
+                    metadata: expect.objectContaining({
+                        synthesizedBy: 'qt-signal-channel',
+                        registeredAt: 'Main.qml:8',
+                    }),
+                }),
+            ]));
+            expect(calls.filter((edge) => edge.target === refresh!.id)).toHaveLength(1);
+        } finally {
+            graph.close();
+        }
+    });
+
+    it('does not guess a Connections signal owner for a dynamic target expression', async () => {
+        tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-qml-connections-dynamic-target-'));
+        fs.writeFileSync(
+            path.join(tempDir, 'native-panel.h'),
+            '#include <QObject>\nclass NativePanel : public QObject {\n    Q_OBJECT\nsignals:\n    void updated();\n};\n',
+        );
+        fs.writeFileSync(
+            path.join(tempDir, 'other-panel.h'),
+            '#include <QObject>\nclass OtherPanel : public QObject {\n    Q_OBJECT\nsignals:\n    void updated();\n};\n',
+        );
+        fs.writeFileSync(
+            path.join(tempDir, 'Main.qml'),
+            `import QtQuick
+Item {
+    NativePanel { id: backend }
+    Connections {
+        target: selectTarget()
+        function onUpdated() {}
+    }
+    function selectTarget() { return backend }
+}
+`,
+        );
+
+        const graph = CodeGraph.initSync(tempDir);
+        try {
+            expect((await graph.indexAll()).success).toBe(true);
+            const handler = graph.getNodesInFile('Main.qml').find(
+                (node) => node.kind === 'method' && node.name === 'onUpdated',
+            );
+            const signalIds = new Set(
+                [...graph.getNodesInFile('native-panel.h'), ...graph.getNodesInFile('other-panel.h')]
+                    .filter((node) => node.kind === 'method' && node.name === 'updated')
+                    .map((node) => node.id),
+            );
+
+            expect(handler).toBeDefined();
+            expect(graph.getOutgoingEdges(handler!.id)).not.toEqual(expect.arrayContaining([
+                expect.objectContaining({ kind: 'calls', target: expect.any(String) }),
+            ]));
+            expect(graph.getOutgoingEdges(handler!.id).some(
+                (edge) => edge.kind === 'calls' && signalIds.has(edge.target),
+            )).toBe(false);
+            expect(graph.getOutgoingEdges(handler!.id).some(
+                (edge) => edge.kind === 'references' && signalIds.has(edge.target),
+            )).toBe(false);
     } finally {
       graph.close();
     }

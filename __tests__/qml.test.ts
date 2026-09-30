@@ -14,13 +14,13 @@ import {
     includeEmbeddedGrammarDependencies,
     initGrammars,
     isSourceFile,
-    loadAllGrammars,
+    loadGrammarsForLanguages,
 } from '../src/extraction/grammars';
 import { blankQtMacros } from '../src/extraction/languages/c-cpp';
 
 beforeAll(async () => {
     await initGrammars();
-    await loadAllGrammars();
+    await loadGrammarsForLanguages(['qml', 'javascript']);
 });
 
 // ---------------------------------------------------------------------------
@@ -231,7 +231,7 @@ Item {
     expect(handler).toBeDefined();
   });
 
-  it('emits an unresolved reference from handler to signal name', () => {
+    it('emits an unresolved reference association from handler to signal name', () => {
     const src = `
 import QtQuick
 Item {
@@ -241,7 +241,7 @@ Item {
     const result = new QmlExtractor('ui/Main.qml', src).extract();
     const ref = result.unresolvedReferences.find((r) => r.referenceName === 'fooChanged');
     expect(ref).toBeDefined();
-    expect(ref!.referenceKind).toBe('calls');
+      expect(ref!.referenceKind).toBe('references');
       expect(ref!.candidates).toEqual(['Main::fooChanged']);
   });
 
@@ -275,6 +275,57 @@ Item {
     expect(fn).toBeDefined();
     expect(fn!.signature).toContain('function greet');
   });
+
+    it('ignores quoted braces and comments while collecting a same-line body', () => {
+        const src = `
+import QtQuick
+Item {
+    /* A commented QML close must not pop Item.
+       }
+    */
+    function update() { const endpoint = "http://example.test/}"; backend.refresh() } // real comment
+    Rectangle {}
+}
+`.trim();
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const refreshCalls = result.unresolvedReferences.filter(
+            (reference) => reference.referenceKind === 'calls' && reference.referenceName === 'backend.refresh',
+        );
+        const root = result.nodes.find((node) => node.kind === 'component' && node.name === 'Main');
+        const rectangle = result.nodes.find((node) => node.kind === 'component' && node.name === 'Rectangle');
+        const importNode = result.nodes.find((node) => node.kind === 'import' && node.name === 'QtQuick');
+
+        expect(refreshCalls).toHaveLength(1);
+        expect(rectangle).toBeDefined();
+        expect(root?.endLine).toBe(src.split('\n').length);
+        expect(importNode?.endLine).toBe(1);
+    });
+
+    it('keeps handler collection open through quoted braces and block comments', () => {
+        const src = `
+import QtQuick
+Item {
+    MouseArea {
+        onClicked: {
+            const endpoint = "http://example.test/}"
+            // } is a real line comment
+            /* { and } are a real block comment
+             */
+            service.start()
+        }
+    }
+    Text {}
+}
+`.trim();
+        const result = new QmlExtractor('ui/Main.qml', src).extract();
+        const startCalls = result.unresolvedReferences.filter(
+            (reference) => reference.referenceKind === 'calls' && reference.referenceName === 'service.start',
+        );
+
+        expect(result.nodes.find((node) => node.kind === 'method' && node.name === 'onClicked')).toBeDefined();
+        expect(result.nodes.find((node) => node.kind === 'component' && node.name === 'Text')).toBeDefined();
+        expect(startCalls).toHaveLength(1);
+    });
 });
 
 describe('QmlExtractor — nested components', () => {
@@ -615,7 +666,7 @@ describe('qtResolver — QML signal handler resolution', () => {
     const ref = {
       fromNodeId: 'handler-1',
         referenceName: 'fooChanged',
-      referenceKind: 'calls' as const,
+        referenceKind: 'references' as const,
       line: 5,
       column: 4,
       filePath: 'ui/Main.qml',
@@ -623,7 +674,6 @@ describe('qtResolver — QML signal handler resolution', () => {
         candidates: ['Widget::fooChanged'],
     };
 
-    // @ts-expect-error — minimal mock
     const resolved = qtResolver.resolve(ref, ctx);
     expect(resolved).not.toBeNull();
     expect(resolved!.targetNodeId).toBe('sig-1');
@@ -660,7 +710,7 @@ describe('qtResolver — QML signal handler resolution', () => {
         const ref = {
             fromNodeId: 'handler-1',
             referenceName: 'clicked',
-            referenceKind: 'calls' as const,
+            referenceKind: 'references' as const,
             line: 5,
             column: 4,
             filePath: 'ui/Main.qml',
@@ -668,7 +718,6 @@ describe('qtResolver — QML signal handler resolution', () => {
             candidates: ['MainBarButton::clicked'],
         };
 
-        // @ts-expect-error — minimal mock
         expect(qtResolver.resolve(ref, ctx)).toBeNull();
     });
 
@@ -676,6 +725,7 @@ describe('qtResolver — QML signal handler resolution', () => {
     const ctx = {
       getAllFiles: () => [],
       readFile: () => null,
+        getNodesInFile: () => [],
       getNodesByName: () => [],
       getNodesByQualifiedName: () => [],
       getNodesByKind: () => [],
@@ -695,7 +745,6 @@ describe('qtResolver — QML signal handler resolution', () => {
       language: 'qml' as const,
     };
 
-    // @ts-expect-error — minimal mock
     const resolved = qtResolver.resolve(ref, ctx);
     expect(resolved).toBeNull();
   });
@@ -747,14 +796,12 @@ describe('qtResolver — QML id receiver resolution', () => {
             methodNode('right-method', 'NativePanel'),
         ]);
 
-        // @ts-expect-error — minimal mock
         expect(qtResolver.resolve(ref, context)?.targetNodeId).toBe('right-method');
     });
 
     it('does not guess when the QML id type has no matching method', () => {
         const context = contextFor([methodNode('wrong-method', 'OtherPanel')]);
 
-        // @ts-expect-error — minimal mock
         expect(qtResolver.resolve(ref, context)).toBeNull();
     });
 });
@@ -1154,7 +1201,7 @@ Item {
     expect(handler).toBeDefined();
   });
 
-  it('emits a calls reference from attached handler to the signal name', () => {
+    it('emits a reference association from attached handler to the signal name', () => {
     const src = `
 import QtQuick
 Item {
@@ -1164,7 +1211,7 @@ Item {
     const result = new QmlExtractor('ui/Main.qml', src).extract();
     const ref = result.unresolvedReferences.find((r) => r.referenceName === 'completed');
     expect(ref).toBeDefined();
-    expect(ref!.referenceKind).toBe('calls');
+      expect(ref!.referenceKind).toBe('references');
   });
 
     it('does not emit project references for built-in attached types', () => {

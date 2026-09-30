@@ -555,7 +555,7 @@ function isQmlSignalHandler(name: string): boolean {
 }
 
 function getOwnedQmlSignal(ref: UnresolvedRef): { ownerName: string; signalName: string } | null {
-    if (ref.language !== 'qml' || ref.referenceKind !== 'calls') return null;
+    if (ref.language !== 'qml' || ref.referenceKind !== 'references') return null;
     for (const candidate of ref.candidates ?? []) {
         const separator = candidate.lastIndexOf('::');
         if (separator <= 0) continue;

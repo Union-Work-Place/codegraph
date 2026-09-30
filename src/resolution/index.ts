@@ -1185,7 +1185,7 @@ export class ReferenceResolver {
                   candidate.startsWith('qt.qml-id|') ||
                   candidate.startsWith('qt.context-property|') ||
                   candidate.startsWith('qt.enum-member|') ||
-                  (ref.referenceKind === 'calls' && candidate.endsWith(`::${ref.referenceName}`)),
+                  (ref.referenceKind === 'references' && candidate.endsWith(`::${ref.referenceName}`)),
           )
       ) {
           return candidates.length > 0
