@@ -11,6 +11,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport 
 import { applyAliases } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
+import { stripCommentsForRegex } from './strip-comments';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -206,6 +207,7 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   luaFileBasenameIndexes.delete(context);
   cobolCopybookIndexes.delete(context);
   pythonModuleFileMemos.delete(context);
+  PY_MODULE_SYMBOLS.delete(context);
 }
 
 export function resolveImportPath(
@@ -936,7 +938,7 @@ export function extractImportMappings(
     // whole SFC (markup + styles included) is safe.
     mappings.push(...extractJSImports(content));
   } else if (language === 'python') {
-    mappings.push(...extractPythonImports(content));
+    mappings.push(...extractPythonImports(stripCommentsForRegex(content, 'python')));
   } else if (language === 'go') {
     mappings.push(...extractGoImports(content));
   } else if (language === 'java' || language === 'kotlin') {
@@ -1065,13 +1067,14 @@ function extractJSImports(content: string): ImportMapping[] {
 function extractPythonImports(content: string): ImportMapping[] {
   const mappings: ImportMapping[] = [];
 
-  // from X import Y
-  const fromImportRegex = /from\s+([\w.]+)\s+import\s+([^#\n]+)/g;
+  // from X import Y, and the parenthesized form `from X import (\n Y,\n Z,\n)`
+  const fromImportRegex = /from\s+([\w.]+)\s+import\s+(\([^)]*\)|[^#\n]+)/g;
   let match;
 
   while ((match = fromImportRegex.exec(content)) !== null) {
     const [, source, imports] = match;
-    const names = imports!.split(',').map((s) => s.trim());
+    const names = imports!.trim().replace(/^\(|\)$/g, '')
+      .split(',').map((s) => s.trim());
 
     for (const name of names) {
       const aliasMatch = name.match(/(\w+)\s+as\s+(\w+)/);
@@ -1528,10 +1531,108 @@ export function resolvePhpImportedStaticCall(
   return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
 }
 
+const JS_MODULE_LANGUAGES: ReadonlySet<string> = new Set(['javascript', 'jsx', 'typescript', 'tsx', 'arkts']);
+
+/**
+ * A module specifier written as a path — relative (`./x`, `../x`), rooted, or
+ * an alias with a folder in it (`@/lib/x`, `~/x`, `$lib/x`) — rather than an
+ * imported binding's name or a bare package (`react`, `lodash`).
+ */
+function isJsPathSpecifier(name: string): boolean {
+  return name.startsWith('./') || name.startsWith('../') || name === '.' || name === '..' ||
+    (name.includes('/') && !/\s/.test(name) && !/^@[\w.-]+\/[\w.-]+$/.test(name));
+}
+
+/**
+ * A JS/TS `imports` reference that names a module by path. It names a FILE, not
+ * a symbol, so it skips the resolver's name-exists pre-filter — a CommonJS
+ * `require('./x')` has no import node of that name to pass it.
+ */
+export function isJsPathImportRef(ref: UnresolvedRef): boolean {
+  return ref.referenceKind === 'imports' && JS_MODULE_LANGUAGES.has(ref.language) && isJsPathSpecifier(ref.referenceName);
+}
+
+/** PHP reference kinds whose name is a class name, written as in the source. */
+const PHP_CLASS_NAME_REFS: ReadonlySet<string> = new Set(['instantiates', 'extends', 'implements', 'references']);
+
+/**
+ * A PHP class name written with a namespace in it (#2256). `use App\Fields as
+ * Field;` aliases a namespace, so `new Field\FirstName()`, `extends Field\Base`
+ * and `Field\FirstName::make()` all name `App\Fields\FirstName`. PHP reads a
+ * qualified name one way: a leading `\` makes it absolute; otherwise a first
+ * segment a `use` imports is replaced by what it imports, and any other name is
+ * relative to the current namespace. Both extractors emit the written name
+ * verbatim, and with no `.` or `::` in it the pre-filter would drop it.
+ * undefined means the ref is not a qualified class name (or names a method the
+ * class inherits); null means it is but no single project class has that name
+ * — it lives outside the project — so name fallbacks must not guess.
+ */
+export function resolvePhpQualifiedClassRef(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null | undefined {
+  if (ref.language !== 'php') return undefined;
+  let name = ref.referenceName;
+  let member: string | null = null;
+  if (ref.referenceKind === 'calls') {
+    // A static call on the class: `Field\FirstName::make()` is written `Field\FirstName.make`.
+    const call = /^(.*\\[^\\.:]+)(?:\.|::)(\w+)$/.exec(name);
+    if (!call) return undefined;
+    name = call[1]!;
+    member = call[2]!;
+  } else if (!PHP_CLASS_NAME_REFS.has(ref.referenceKind)) {
+    return undefined;
+  }
+  const separator = name.indexOf('\\');
+  if (separator < 0) return undefined;
+
+  let fqn: string;
+  if (separator === 0) {
+    fqn = name.slice(1);
+  } else {
+    const head = name.slice(0, separator);
+    const imp = context.getImportMappings(ref.filePath, ref.language).find((i) => i.localName === head);
+    if (imp) {
+      fqn = imp.source.replace(/^\\/, '') + name.slice(separator);
+    } else {
+      // `namespace App;` applies until the next namespace statement.
+      const namespace = context.getNodesInFile(ref.filePath)
+        .filter((n) => n.kind === 'namespace' && n.startLine <= ref.line)
+        .sort((a, b) => b.startLine - a.startLine)[0];
+      fqn = namespace ? `${namespace.qualifiedName}\\${name}` : name;
+    }
+  }
+
+  const cut = fqn.lastIndexOf('\\');
+  const qualifiedName = cut < 0 ? fqn : `${fqn.slice(0, cut)}::${fqn.slice(cut + 1)}`;
+  const classes = context.getNodesByQualifiedName(qualifiedName)
+    .filter((n) => n.language === 'php' && STATIC_MEMBER_CONTAINERS.has(n.kind));
+  // A type mention can name something other than a class (a namespaced
+  // constant or function), so it keeps the ordinary strategies.
+  if (classes.length !== 1) return ref.referenceKind === 'references' ? undefined : null;
+  const owner = classes[0]!;
+  if (!member) return { original: ref, targetNodeId: owner.id, confidence: 0.95, resolvedBy: 'import' };
+  const methods = context.getNodesByQualifiedName(`${owner.qualifiedName}::${member}`)
+    .filter((n) => n.language === 'php' && n.kind === 'method' && n.filePath === owner.filePath);
+  // A method the class inherits is left to the strategies that walk supertypes.
+  if (methods.length !== 1) return undefined;
+  return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
+}
+
 export function resolveViaImport(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  // A JS/TS module specifier — `import './polyfills'`, the module of `import x
+  // from '../lib/a'`, a CommonJS `require('./application')` — names a FILE,
+  // found the way the runtime finds it: extensions, `index` files, path
+  // aliases. Matching the basename instead missed every extensionless one
+  // (the common spelling) and could land on a same-named file elsewhere.
+  if (isJsPathImportRef(ref)) {
+    const file = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
+    if (fileNode) return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+  }
   // C/C++ #include references — resolve directly to the included file
   // (file→file edge), bypassing symbol lookup. The extractor emits these
   // with `referenceKind: 'imports'` and `referenceName: <include path>`
@@ -1763,9 +1864,7 @@ export function resolveViaImport(
           context,
           new Set()
         ) ?? (ref.language === 'python'
-          ? context.getNodesInFile(resolvedPath).find(n =>
-              n.name === (memberName ?? exportedName) && !n.qualifiedName.includes('::') &&
-              (n.kind === 'class' || n.kind === 'function' || n.kind === 'variable' || n.kind === 'constant'))
+          ? pythonModuleSymbol(resolvedPath, memberName ?? exportedName, context, 0)
           : undefined);
 
         if (targetNode) {
@@ -1898,16 +1997,10 @@ function resolvePythonModuleMember(
     }
     if (!resolvedPath || resolvedPath === ref.filePath) continue;
 
-    // Find the member as a top-level definition in the module file. Exclude
-    // `method` so `mod.foo` never lands on a same-named class method.
-    const target = context.getNodesInFile(resolvedPath).find(
-      (n) =>
-        n.name === member &&
-        (n.kind === 'function' ||
-          n.kind === 'class' ||
-          n.kind === 'variable' ||
-          n.kind === 'constant')
-    );
+    // Find the member as a top-level definition in the module file, or one it
+    // re-exports (a package's `__init__.py`). Exclude `method` so `mod.foo`
+    // never lands on a same-named class method.
+    const target = pythonModuleSymbol(resolvedPath, member, context, 0);
     if (target) {
       return { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'import' };
     }
@@ -2076,6 +2169,49 @@ function resolveModuleImportToFile(
  * caches; dropped by clearImportResolverMemos.
  */
 const pythonModuleFileMemos = new WeakMap<ResolutionContext, Map<string, { module: Node[]; pkg: Node[] }>>();
+
+/**
+ * A top-level class / function / value named `name` in a Python module, or
+ * one the module re-exports — `from .users import *`, `from .users import
+ * User` — a few packages deep. netbox's `from users.models import User` names
+ * `users/models/__init__.py`, which star-imports `.users`, where `User` is.
+ */
+const PY_MODULE_SYMBOLS = new WeakMap<ResolutionContext, Map<string, Node | null>>();
+
+function pythonModuleSymbol(file: string, name: string, context: ResolutionContext, depth: number): Node | undefined {
+  let memo = PY_MODULE_SYMBOLS.get(context);
+  if (!memo) PY_MODULE_SYMBOLS.set(context, (memo = new Map()));
+  const key = `${file}\0${name}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit ?? undefined;
+  // (A cycle of star imports reads as "not here" while it is being walked.)
+  memo.set(key, null);
+  const found = pythonModuleSymbolUncached(file, name, context, depth);
+  memo.set(key, found ?? null);
+  return found;
+}
+
+function pythonModuleSymbolUncached(file: string, name: string, context: ResolutionContext, depth: number): Node | undefined {
+  const own = context.getNodesInFile(file).find((n) =>
+    n.name === name && !n.qualifiedName.includes('::') &&
+    (n.kind === 'class' || n.kind === 'function' || n.kind === 'variable' || n.kind === 'constant'));
+  if (own || depth >= 3) return own;
+  // Re-exported by name (`from .users import User`), else through a star import
+  // (`from .users import *` — not among the import mappings, so read here).
+  const sources: Array<{ source: string; exported: string }> = context.getImportMappings(file, 'python')
+    .filter((imp) => !imp.isNamespace && imp.localName === name)
+    .map((imp) => ({ source: imp.source, exported: imp.exportedName }));
+  for (const m of (context.readFile(file) ?? '').matchAll(/^\s*from\s+([\w.]+)\s+import\s+\*/gm)) {
+    sources.push({ source: m[1]!, exported: name });
+  }
+  for (const { source, exported } of sources) {
+    const target = resolveImportPath(source, file, 'python', context) ?? findPythonModuleFile(source, context, file)?.filePath ?? null;
+    if (!target || target === file) continue;
+    const found = pythonModuleSymbol(target, exported, context, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
 
 function findPythonModuleFile(
   mod: string,

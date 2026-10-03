@@ -10,6 +10,9 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 import { dependsOn } from './package-deps';
 import { resolveImportPath } from '../import-resolver';
 
+/** The languages React components, hooks and contexts are written and used in. */
+const REACT_SCRIPT_LANGUAGES: ReadonlySet<string> = new Set(['typescript', 'javascript', 'tsx', 'jsx']);
+
 export const reactResolver: FrameworkResolver = {
   name: 'react',
   // Includes 'tsx'/'jsx' so route extraction runs on JSX files (where
@@ -34,6 +37,9 @@ export const reactResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Components, hooks and contexts are a script's: halo's Java
+    // `import org.springframework…SecurityContext` is no React context.
+    if (!REACT_SCRIPT_LANGUAGES.has(ref.language)) return null;
     if (ref.referenceName.startsWith(LAZY_ROUTE_PREFIX)) {
       const target = lazyRouteComponent(ref.referenceName.slice(LAZY_ROUTE_PREFIX.length), ref.filePath, context);
       return target ? { original: ref, targetNodeId: target, confidence: 0.9, resolvedBy: 'framework' } : null;
@@ -73,7 +79,7 @@ export const reactResolver: FrameworkResolver = {
 
     // Pattern 2: Hook references (use*)
     if (ref.referenceName.startsWith('use') && ref.referenceName.length > 3) {
-      const result = resolveHook(ref.referenceName, ref.filePath, context);
+      const result = resolveHook(ref.referenceName, ref.filePath, context, ref.language);
       if (result) {
         return {
           original: ref,
@@ -86,7 +92,7 @@ export const reactResolver: FrameworkResolver = {
 
     // Pattern 3: Context references
     if (ref.referenceName.endsWith('Context') || ref.referenceName.endsWith('Provider')) {
-      const result = resolveContext(ref.referenceName, context);
+      const result = resolveContext(ref.referenceName, ref, context);
       if (result) {
         return {
           original: ref,
@@ -635,10 +641,16 @@ function resolveComponent(
   return components.length === 1 ? components[0]!.id : null;
 }
 
+/** JS/TS (and their JSX dialects): modules where a cross-file name needs an import. */
+function isEsmLanguage(language?: string): boolean {
+  return language === 'typescript' || language === 'tsx' || language === 'javascript' || language === 'jsx';
+}
+
+
 /**
  * Resolve a custom hook reference using name-based lookup
  */
-function resolveHook(name: string, fromFile: string, context: ResolutionContext): string | null {
+function resolveHook(name: string, fromFile: string, context: ResolutionContext, language?: string): string | null {
   const candidates = context.getNodesByName(name);
   if (candidates.length === 0) return null;
 
@@ -651,6 +663,10 @@ function resolveHook(name: string, fromFile: string, context: ResolutionContext)
   if (hooks.length === 0) return null;
   const sameFile = hooks.find((n) => n.filePath === fromFile);
   if (sameFile) return sameFile.id;
+  // A JS/TS module reaches another file's hook only by importing it — the
+  // import resolver's to follow (an imported name never gets here) — never
+  // by name alone.
+  if (isEsmLanguage(language)) return null;
 
   // Prefer hooks directories
   const HOOK_DIRS = ['/hooks/', '/src/hooks/', '/lib/hooks/', '/utils/hooks/'];
@@ -665,7 +681,13 @@ function resolveHook(name: string, fromFile: string, context: ResolutionContext)
 /**
  * Resolve a context reference using name-based lookup
  */
-function resolveContext(name: string, context: ResolutionContext): string | null {
+function resolveContext(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  // In a JS/TS module only the file's own context is in reach by name; another
+  // file's comes through an import (trpc's adapters' `createContext?.(…)` is an
+  // option, not an example app's `createContext`).
+  if (isEsmLanguage(ref.language)) {
+    return context.getNodesByName(name).find((n) => n.filePath === ref.filePath)?.id ?? null;
+  }
   const candidates = context.getNodesByName(name);
   if (candidates.length === 0) {
     // Try without Context/Provider suffix
