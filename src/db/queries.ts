@@ -1516,7 +1516,7 @@ export class QueryBuilder {
       "SELECT 1 FROM nodes WHERE kind = 'method' AND (signature LIKE 'signal %' OR signature LIKE 'slot %') LIMIT 1"
     ).get();
     if (hasSignalOrSlot) return true;
-    
+
     // Qt context properties from QML registration
     const hasQmlReg = this.db.prepare(
       "SELECT 1 FROM nodes WHERE kind = 'variable' AND name LIKE 'qt-context-property:%' LIMIT 1"
@@ -1525,7 +1525,6 @@ export class QueryBuilder {
 
     return false;
   }
-
 
   /**
    * Get all nodes in the database
